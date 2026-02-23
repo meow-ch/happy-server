@@ -11,7 +11,7 @@ WORKDIR /app
 COPY package.json ./
 COPY prisma ./prisma
 
-RUN yarn install --frozen-lockfile --ignore-engines
+RUN yarn install --frozen-lockfile --ignore-engines --network-timeout 300000
 
 # Stage 2: runtime
 FROM node:20-slim AS runner
