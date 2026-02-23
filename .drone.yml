@@ -1,0 +1,32 @@
+kind: pipeline
+type: docker
+name: build-and-deploy
+
+trigger:
+  branch: [master]
+  event: [push]
+
+steps:
+- name: build
+  image: registry.sn1994.zivili.ch/meow/drone-build-v2:latest
+  environment:
+    VAULT_ADDR: https://vault.sn1994.zivili.ch
+    VAULT_ROLE_ID:
+      from_secret: VAULT_ROLE_ID
+    VAULT_SECRET_ID:
+      from_secret: VAULT_SECRET_ID
+    DOCKERCONFIGJSON:
+      from_secret: dockerconfigjson
+
+- name: deploy
+  image: registry.sn1994.zivili.ch/meow/drone-deploy-v2:latest
+  environment:
+    VAULT_ADDR: https://vault.sn1994.zivili.ch
+    VAULT_ROLE_ID:
+      from_secret: VAULT_ROLE_ID
+    VAULT_SECRET_ID:
+      from_secret: VAULT_SECRET_ID
+    DOCKERCONFIGJSON:
+      from_secret: dockerconfigjson
+
+image_pull_secrets: [dockerconfigjson]

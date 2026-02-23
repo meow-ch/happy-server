@@ -1,0 +1,92 @@
+services:
+  app:
+    image: ${DOCKER_IMAGE}:${DOCKER_IMAGE_TAG:-latest}
+    restart: unless-stopped
+    environment:
+      - DATABASE_URL
+      - REDIS_URL
+      - S3_HOST
+      - S3_PORT
+      - S3_USE_SSL
+      - S3_ACCESS_KEY
+      - S3_SECRET_KEY
+      - S3_BUCKET
+      - S3_PUBLIC_URL
+      - JWT_SECRET
+      - HANDY_MASTER_SECRET
+    networks:
+      - shared_network
+      - internal
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.${ROUTER_NAME}.rule=Host(`${DOMAIN}`)"
+      - "traefik.http.routers.${ROUTER_NAME}.entrypoints=websecure"
+      - "traefik.http.routers.${ROUTER_NAME}.tls.certresolver=myresolver"
+      - "traefik.http.services.${ROUTER_NAME}.loadbalancer.server.port=3005"
+      - "traefik.docker.network=shared_network"
+    depends_on:
+      - postgres
+      - redis
+      - minio
+
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=happy
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=happy
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - internal
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    networks:
+      - internal
+
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      - MINIO_ROOT_USER=${S3_ACCESS_KEY}
+      - MINIO_ROOT_PASSWORD=${S3_SECRET_KEY}
+    volumes:
+      - minio_data:/data
+    networks:
+      - internal
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      sleep 5;
+      mc alias set local http://minio:9000 $${S3_ACCESS_KEY} $${S3_SECRET_KEY};
+      mc mb local/$${S3_BUCKET} --ignore-existing;
+      mc anonymous set download local/$${S3_BUCKET};
+      exit 0;
+      "
+    environment:
+      - S3_ACCESS_KEY=${S3_ACCESS_KEY}
+      - S3_SECRET_KEY=${S3_SECRET_KEY}
+      - S3_BUCKET=${S3_BUCKET}
+    networks:
+      - internal
+
+volumes:
+  postgres_data:
+    name: happy_postgres_data
+    external: true
+  minio_data:
+    name: happy_minio_data
+    external: true
+
+networks:
+  shared_network:
+    external: true
+  internal:

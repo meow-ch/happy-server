@@ -1,0 +1,18 @@
+version: 2
+
+instances:
+  prod:
+    branches: [master]
+    targets: [sn208133]
+    deploy_key_scope: standalone-sn208133
+    build:
+      context: .
+      tags: [latest, "${DRONE_COMMIT_SHA}"]
+      images:
+        - name: server
+          image_env: DOCKER_IMAGE
+          dockerfile: Dockerfile
+    compose:
+      remote_dir: /home/drone/apps/happy-server
+      project_name: happy-server
+      file: docker-compose.yml
