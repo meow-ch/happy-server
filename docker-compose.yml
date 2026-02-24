@@ -30,7 +30,7 @@ services:
       - minio
 
   postgres:
-    image: postgres:16
+    image: registry.sn1994.zivili.ch/library/postgres:16
     restart: unless-stopped
     environment:
       - POSTGRES_USER=happy
@@ -42,13 +42,13 @@ services:
       - internal
 
   redis:
-    image: redis:7-alpine
+    image: registry.sn1994.zivili.ch/library/redis:7-alpine
     restart: unless-stopped
     networks:
       - internal
 
   minio:
-    image: minio/minio:latest
+    image: registry.sn1994.zivili.ch/library/minio-minio:RELEASE.2025-09-07T16-13-09Z
     restart: unless-stopped
     command: server /data --console-address ":9001"
     environment:
@@ -60,7 +60,7 @@ services:
       - internal
 
   minio-init:
-    image: minio/mc:latest
+    image: registry.sn1994.zivili.ch/library/minio-mc:RELEASE.2025-08-13T08-35-41Z
     depends_on:
       - minio
     entrypoint: >
