@@ -16,3 +16,4 @@ instances:
       remote_dir: /home/drone/apps/happy-server
       project_name: happy-server
       file: docker-compose.yml
+    healthcheck_exempt: true
