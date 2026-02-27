@@ -5,7 +5,7 @@
 Deployed to standalone node (ov8374) via Drone CI.
 
 - **Branch:** `master` (prod)
-- **Domain:** happy.zivili.ch
+- **Domain:** server.boujot.com
 - **Registry:** registry.sn1994.zivili.ch/meow/happy
 
 ## Stack
