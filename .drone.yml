@@ -8,7 +8,7 @@ trigger:
 
 steps:
 - name: build
-  image: registry.sn1994.zivili.ch/meow/drone-build-v2:latest
+  image: registry.sn1994.zivili.ch/meow/drone-build-v2:c0119d1
   environment:
     VAULT_ADDR: https://vault.sn1994.zivili.ch
     VAULT_ROLE_ID:
