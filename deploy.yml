@@ -5,6 +5,12 @@ instances:
     branches: [master]
     targets: [sn208133]
     deploy_key_scope: standalone-sn208133
+    secrets_mode: node_vault_agent
+    vault:
+      runtime_path: prod/tenants/meow/apps/boujot/happy-server/prod
+    vault_agent:
+      expected_files:
+        - env
     build:
       context: .
       tags: [latest, "${DRONE_COMMIT_SHA}"]

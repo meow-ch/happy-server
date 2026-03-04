@@ -8,24 +8,25 @@ trigger:
 
 steps:
 - name: build
-  image: registry.sn1994.zivili.ch/meow/drone-build-v2:c0119d1
+  image: registry.sn1994.zivili.ch/meow/drone-build-v2:2f5850d
   environment:
     VAULT_ADDR: https://vault.sn1994.zivili.ch
     VAULT_ROLE_ID:
-      from_secret: VAULT_ROLE_ID
+      from_secret: VAULT_DEPLOY_ROLE_ID
     VAULT_SECRET_ID:
-      from_secret: VAULT_SECRET_ID
+      from_secret: VAULT_DEPLOY_SECRET_ID
     DOCKERCONFIGJSON:
       from_secret: dockerconfigjson
 
 - name: deploy
-  image: registry.sn1994.zivili.ch/meow/drone-deploy-v2:latest
+  image: registry.sn1994.zivili.ch/meow/drone-deploy-v2:ee13ac0
   environment:
+    DOCKER_IMAGE_TAG: ${DRONE_COMMIT_SHA}
     VAULT_ADDR: https://vault.sn1994.zivili.ch
     VAULT_ROLE_ID:
-      from_secret: VAULT_ROLE_ID
+      from_secret: VAULT_DEPLOY_ROLE_ID
     VAULT_SECRET_ID:
-      from_secret: VAULT_SECRET_ID
+      from_secret: VAULT_DEPLOY_SECRET_ID
     DOCKERCONFIGJSON:
       from_secret: dockerconfigjson
 
