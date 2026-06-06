@@ -19,7 +19,7 @@ steps:
       from_secret: dockerconfigjson
 
 - name: deploy
-  image: registry.sn1994.zivili.ch/meow/drone-deploy-v2:52bdce4
+  image: registry.sn1994.zivili.ch/meow/drone-deploy-v2:1fe07ae
   environment:
     DOCKER_IMAGE_TAG: ${DRONE_COMMIT_SHA}
     VAULT_ADDR: https://vault.sn1994.zivili.ch
