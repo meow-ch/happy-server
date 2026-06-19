@@ -5,6 +5,7 @@ dist
 .minio
 
 .env.local
+.env.prod
 .env
 
 .logs/
