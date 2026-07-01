@@ -28,7 +28,15 @@ export function startSocket(app: Fastify) {
         allowUpgrades: true,
         upgradeTimeout: 10000,
         connectTimeout: 20000,
+        maxHttpBufferSize: 8 * 1024 * 1024,
         serveClient: false // Don't serve the client files
+    });
+
+    io.engine.on("connection_error", (err) => {
+        log(
+            { module: 'websocket', level: 'error' },
+            `Socket connection error code=${err.code} message=${err.message} context=${JSON.stringify(err.context ?? {})}`
+        );
     });
 
     let rpcListeners = new Map<string, Map<string, Socket>>();
