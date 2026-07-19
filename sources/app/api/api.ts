@@ -65,16 +65,16 @@ export async function startApi() {
     feedRoutes(typed);
     kvRoutes(typed);
 
-    // Start HTTP 
+    // Attach realtime handlers before the HTTP server accepts connections so
+    // the durable notification consumer cannot miss an early socket message.
+    await startSocket(typed);
+
+    // Start HTTP
     const port = process.env.PORT ? parseInt(process.env.PORT, 10) : 3005;
     await app.listen({ port, host: '0.0.0.0' });
     onShutdown('api', async () => {
         await app.close();
     });
-
-    // Start Socket
-    startSocket(typed);
-
     // End
     log('API ready on port http://localhost:' + port);
 }

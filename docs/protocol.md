@@ -34,6 +34,8 @@ auth: {
   token: "<bearer token>",
   clientType: "user-scoped" | "session-scoped" | "machine-scoped",
   sessionId?: "<session id>",
+  sessionInstanceId?: "<runtime UUID>",
+  replayOnly?: boolean,
   machineId?: "<machine id>"
 }
 ```
@@ -41,6 +43,10 @@ auth: {
 Rules enforced server-side:
 - `token` is required.
 - `session-scoped` requires `sessionId`.
+- Durable session runtimes supply a UUID `sessionInstanceId`. The server claims
+  it before CONNECT, fencing termination and heartbeat writes to that runtime.
+- `replayOnly: true` is reserved for daemon outbox recovery; it may claim only
+  a previously unclaimed instance and never supersedes a live runtime.
 - `machine-scoped` requires `machineId`.
 
 ### Connection types
@@ -134,15 +140,26 @@ Field names below match on-wire payloads.
 
 - `message`
   - `{ sid, message, localId? }`
-  - Creates a new session message (encrypted payload) and emits `new-message` update to other connections.
+  - Optional acknowledgement after the database commit: `{ result: "success", duplicate, message: { id, seq, localId, createdAt, updatedAt } }`.
+  - Errors use `{ result: "error", code, retryable }`; reusing a `(sid, localId)` with different ciphertext returns `code: "idempotency_conflict"`.
+  - A supplied `localId` must be a canonical 36-character UUID. Retrying identical ciphertext with the same UUID is idempotent. Producers without a callback or `localId` remain supported but do not get durable retry semantics.
+  - The acknowledgement means the message and its notification outbox row committed together. Redis Pub/Sub is only a best-effort live wakeup; PostgreSQL is canonical. Consumers must deduplicate by update/message id and reconcile with the cursor API on startup, reconnect, and sequence gaps.
+  - Encrypted ciphertext is limited to 7 MiB per event.
 
 - `session-alive`
   - `{ sid, time, thinking? }`
   - Emits `ephemeral` activity to user-scoped connections.
 
 - `session-end`
-  - `{ sid, time }`
-  - Marks session inactive and emits `ephemeral` activity.
+  - Legacy form: `{ sid, time }` (no durable acknowledgement).
+  - Durable form: `{ sid, time, localId, sessionInstanceId }`, where both IDs
+    are canonical UUIDs and `time` is the persisted marker creation time.
+  - Success acknowledgement after the inactive state commits:
+    `{ result: "success", localId }`. Errors use
+    `{ result: "error", code, retryable }`.
+  - The server applies a durable end only to its originating active runtime
+    instance. ACK-loss retries are successful no-ops after the first commit,
+    and an old marker cannot terminate a later resumed instance.
 
 - `usage-report`
   - `{ key, sessionId?, tokens, cost }`
@@ -187,8 +204,10 @@ Field names below match on-wire payloads.
   - `{ method }` -> server emits `rpc-unregistered`
 
 - `rpc-call`
-  - `{ method, params }` -> callback `{ ok, result? | error? }`
-  - Server forwards to the registered socket via `rpc-request` (ack-based).
+  - `{ method, params, callId? }` -> callback `{ ok, result? | error?, callId? }`.
+  - When present, `callId` is a UUID forwarded unchanged in `rpc-request` and echoed by the server.
+  - The server resolves one generation-fenced Redis registration and attempts exactly that socket. After an attempted delivery, a timeout/disconnect returns `{ ok: false, outcome: "unknown" }`; it never fails over because execution may already have happened.
+  - RPC parameters are limited to 4 MiB after serialization.
 
 ## HTTP endpoints by area
 See `api.md` for the full HTTP endpoint catalog and auth flows.
@@ -197,6 +216,13 @@ See `api.md` for the full HTTP endpoint catalog and auth flows.
 - `UpdatePayload.seq` is the per-user update sequence (monotonic) used for sync ordering.
 - Sessions, machines, and artifacts have their own `seq` fields used by clients for ordering.
 - Versioned fields (metadata, agentState, daemonState, artifact header/body, access keys, KV) use optimistic concurrency with `expectedVersion` and return a version-mismatch response containing the current version/data.
+
+## Realtime reliability configuration
+
+- `SOCKET_IO_REDIS_CHANNEL_PREFIX` (default `happy:socket.io`) selects the official Socket.IO Redis Pub/Sub adapter's channel prefix. Socket.IO connection-state recovery is disabled.
+- `SESSION_MESSAGE_NOTIFICATION_REDIS_CHANNEL` (default `happy:session-message-notifications`) carries committed message wakeups to every server pod through Redis Pub/Sub.
+- Redis contains only transient Pub/Sub traffic and small TTL RPC registration values (`socketId` plus a sortable generation). It is not message retention; PostgreSQL and the message cursor are the recovery path.
+- Compose and Kubernetes configure AOF persistence, a volume, and a bounded `volatile-ttl` memory policy. Registry keys self-reclaim after Redis restarts and converge to the freshest connected generation.
 
 ## Implementation references
 - API routes: `packages/happy-server/sources/app/api/routes`

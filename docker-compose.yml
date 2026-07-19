@@ -5,6 +5,8 @@ services:
     environment:
       - DATABASE_URL
       - REDIS_URL
+      - SOCKET_IO_REDIS_CHANNEL_PREFIX
+      - SESSION_MESSAGE_NOTIFICATION_REDIS_CHANNEL
       - S3_HOST
       - S3_PORT
       - S3_USE_SSL
@@ -44,6 +46,18 @@ services:
   redis:
     image: registry.sn1994.zivili.ch/library/redis:7-alpine
     restart: unless-stopped
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - volatile-ttl
+    volumes:
+      - redis_data:/data
     networks:
       - internal
 
@@ -85,6 +99,8 @@ volumes:
   minio_data:
     name: happy_minio_data
     external: true
+  redis_data:
+    name: happy_redis_data
 
 networks:
   shared_network:

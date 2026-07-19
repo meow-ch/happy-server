@@ -43,8 +43,13 @@ Auth flows:
 - `GET /v2/sessions/active?limit=...`
 - `GET /v2/sessions?cursor=cursor_v1_<id>&limit=...&changedSince=...`
 - `POST /v1/sessions` (create or load by `tag`)
-- `GET /v1/sessions/:sessionId/messages`
+- `GET /v1/sessions/:sessionId/messages` (legacy latest 150)
+- `GET /v1/sessions/:sessionId/messages?afterSeq=...&limit=...` (canonical ascending cursor replay, up to 500 per page; use on startup, reconnect, and sequence gaps because Redis fanout is best-effort)
 - `DELETE /v1/sessions/:sessionId`
+
+Cursor replay returns `{ messages, hasMore, nextAfterSeq }`. Continue until
+`hasMore` is false and retain `nextAfterSeq`; live notifications are
+best-effort, potentially duplicate hints, while this endpoint is the authoritative gap repair path.
 
 ### Machines
 - `POST /v1/machines` (create or load by id)

@@ -7,6 +7,7 @@ import { log } from "@/utils/log";
 import { randomKeyNaked } from "@/utils/randomKeyNaked";
 import { allocateUserSeq } from "@/storage/seq";
 import { sessionDelete } from "@/app/session/sessionDelete";
+import { listStoredSessionMessagesAfterSeq } from "@/app/session/sessionMessageList";
 
 export function sessionRoutes(app: Fastify) {
 
@@ -309,7 +310,11 @@ export function sessionRoutes(app: Fastify) {
         schema: {
             params: z.object({
                 sessionId: z.string()
-            })
+            }),
+            querystring: z.object({
+                afterSeq: z.coerce.number().int().min(0).optional(),
+                limit: z.coerce.number().int().min(1).max(500).default(500)
+            }).optional()
         },
         preHandler: app.authenticate
     }, async (request, reply) => {
@@ -326,6 +331,16 @@ export function sessionRoutes(app: Fastify) {
 
         if (!session) {
             return reply.code(404).send({ error: 'Session not found' });
+        }
+
+        // Supplying afterSeq opts into lossless, ascending cursor replay. Omitting
+        // it preserves the legacy latest-150 response for existing clients.
+        if (request.query?.afterSeq !== undefined) {
+            return reply.send(await listStoredSessionMessagesAfterSeq({
+                sessionId,
+                afterSeq: request.query.afterSeq,
+                limit: request.query.limit ?? 500
+            }));
         }
 
         const messages = await db.sessionMessage.findMany({

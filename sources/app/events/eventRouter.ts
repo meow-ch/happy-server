@@ -1,4 +1,4 @@
-import { Socket } from "socket.io";
+import { Server, Socket } from "socket.io";
 import { log } from "@/utils/log";
 import { GitHubProfile } from "@/app/api/types";
 import { AccountProfile } from "@/types";
@@ -11,6 +11,8 @@ export interface SessionScopedConnection {
     socket: Socket;
     userId: string;
     sessionId: string;
+    sessionInstanceId?: string;
+    replayOnly?: boolean;
 }
 
 export interface UserScopedConnection {
@@ -28,6 +30,8 @@ export interface MachineScopedConnection {
 
 export type ClientConnection = SessionScopedConnection | UserScopedConnection | MachineScopedConnection;
 
+type ConnectionScope = Omit<SessionScopedConnection, "socket"> | Omit<UserScopedConnection, "socket"> | Omit<MachineScopedConnection, "socket">;
+
 // === RECIPIENT FILTER TYPES ===
 
 export type RecipientFilter =
@@ -35,6 +39,35 @@ export type RecipientFilter =
     | { type: 'user-scoped-only' }
     | { type: 'machine-scoped-only'; machineId: string }  // For update-machine: sends to user-scoped + only the specific machine
     | { type: 'all-user-authenticated-connections' };
+
+function accountRoom(userId: string, scope: string): string {
+    return `account:${userId}:${scope}`;
+}
+
+export function getConnectionRooms(connection: ClientConnection | ConnectionScope): string[] {
+    const rooms = [accountRoom(connection.userId, "all")];
+    if (connection.connectionType === "user-scoped") {
+        rooms.push(accountRoom(connection.userId, "user"));
+    } else if (connection.connectionType === "session-scoped") {
+        rooms.push(accountRoom(connection.userId, `session:${connection.sessionId}`));
+    } else {
+        rooms.push(accountRoom(connection.userId, `machine:${connection.machineId}`));
+    }
+    return rooms;
+}
+
+export function getRecipientRooms(userId: string, filter: RecipientFilter): string[] {
+    switch (filter.type) {
+        case "all-interested-in-session":
+            return [accountRoom(userId, "user"), accountRoom(userId, `session:${filter.sessionId}`)];
+        case "user-scoped-only":
+            return [accountRoom(userId, "user")];
+        case "machine-scoped-only":
+            return [accountRoom(userId, "user"), accountRoom(userId, `machine:${filter.machineId}`)];
+        case "all-user-authenticated-connections":
+            return [accountRoom(userId, "all")];
+    }
+}
 
 // === UPDATE EVENT TYPES (Persistent) ===
 
@@ -198,10 +231,22 @@ export interface EphemeralPayload {
     [key: string]: any;
 }
 
+/** A best-effort Pub/Sub wakeup for a session message already committed in Postgres. */
+export interface DurableSessionMessageNotification {
+    userId: string;
+    payload: UpdatePayload;
+    originSocketId: string | null;
+}
+
 // === EVENT ROUTER CLASS ===
 
 class EventRouter {
     private userConnections = new Map<string, Set<ClientConnection>>();
+    private io: Server | null = null;
+
+    setServer(io: Server): void {
+        this.io = io;
+    }
 
     // === CONNECTION MANAGEMENT ===
 
@@ -258,6 +303,34 @@ class EventRouter {
         });
     }
 
+    /**
+     * Delivers a notification only to sockets connected to this server. Every
+     * server consumes the same Redis Pub/Sub channel, so using the Socket.IO
+     * cluster adapter again here would multiply each notification by pod count.
+     */
+    emitDurableSessionMessageLocal(notification: DurableSessionMessageNotification): void {
+        const recipientFilter: RecipientFilter = {
+            type: 'all-interested-in-session',
+            sessionId: notification.payload.body.sid as string
+        };
+        if (this.io) {
+            let target = this.io.local.to(getRecipientRooms(notification.userId, recipientFilter));
+            if (notification.originSocketId) {
+                target = target.except(notification.originSocketId);
+            }
+            target.emit('update', notification.payload);
+            return;
+        }
+
+        const connections = this.userConnections.get(notification.userId);
+        if (!connections) return;
+        for (const connection of connections) {
+            if (connection.socket.id === notification.originSocketId) continue;
+            if (!this.shouldSendToConnection(connection, recipientFilter)) continue;
+            connection.socket.emit('update', notification.payload);
+        }
+    }
+
     // === PRIVATE ROUTING LOGIC ===
 
     private shouldSendToConnection(
@@ -306,6 +379,15 @@ class EventRouter {
         recipientFilter: RecipientFilter;
         skipSenderConnection?: ClientConnection;
     }): void {
+        if (this.io) {
+            const rooms = getRecipientRooms(params.userId, params.recipientFilter);
+            const target = params.skipSenderConnection
+                ? params.skipSenderConnection.socket.to(rooms)
+                : this.io.to(rooms);
+            target.emit(params.eventName, params.payload);
+            return;
+        }
+
         const connections = this.userConnections.get(params.userId);
         if (!connections) {
             log({ module: 'websocket', level: 'warn' }, `No connections found for user ${params.userId}`);

@@ -5,7 +5,10 @@ import { sessionCacheCounter, databaseUpdatesSkippedCounter } from "@/app/monito
 interface SessionCacheEntry {
     validUntil: number;
     lastUpdateSent: number;
-    pendingUpdate: number | null;
+    pendingUpdate: {
+        timestamp: number;
+        sessionInstanceId?: string;
+    } | null;
     userId: string;
 }
 
@@ -16,7 +19,7 @@ interface MachineCacheEntry {
     userId: string;
 }
 
-class ActivityCache {
+export class ActivityCache {
     private sessionCache = new Map<string, SessionCacheEntry>();
     private machineCache = new Map<string, MachineCacheEntry>();
     private batchTimer: NodeJS.Timeout | null = null;
@@ -123,7 +126,7 @@ class ActivityCache {
         }
     }
 
-    queueSessionUpdate(sessionId: string, timestamp: number): boolean {
+    queueSessionUpdate(sessionId: string, timestamp: number, sessionInstanceId?: string): boolean {
         const cached = this.sessionCache.get(sessionId);
         if (!cached) {
             return false; // Should validate first
@@ -132,7 +135,7 @@ class ActivityCache {
         // Only queue if time difference is significant
         const timeDiff = Math.abs(timestamp - cached.lastUpdateSent);
         if (timeDiff > this.UPDATE_THRESHOLD) {
-            cached.pendingUpdate = timestamp;
+            cached.pendingUpdate = { timestamp, sessionInstanceId };
             return true;
         }
         
@@ -157,15 +160,15 @@ class ActivityCache {
         return false; // No update needed
     }
 
-    private async flushPendingUpdates(): Promise<void> {
-        const sessionUpdates: { id: string, timestamp: number }[] = [];
+    async flushPendingUpdates(): Promise<void> {
+        const sessionUpdates: { id: string, timestamp: number, sessionInstanceId?: string }[] = [];
         const machineUpdates: { id: string, timestamp: number, userId: string }[] = [];
         
         // Collect session updates
         for (const [sessionId, entry] of this.sessionCache.entries()) {
             if (entry.pendingUpdate) {
-                sessionUpdates.push({ id: sessionId, timestamp: entry.pendingUpdate });
-                entry.lastUpdateSent = entry.pendingUpdate;
+                sessionUpdates.push({ id: sessionId, ...entry.pendingUpdate });
+                entry.lastUpdateSent = entry.pendingUpdate.timestamp;
                 entry.pendingUpdate = null;
             }
         }
@@ -187,8 +190,24 @@ class ActivityCache {
         if (sessionUpdates.length > 0) {
             try {
                 await Promise.all(sessionUpdates.map(update =>
-                    db.session.update({
-                        where: { id: update.id },
+                    db.session.updateMany({
+                        where: {
+                            id: update.id,
+                            // A session-end write carries a timestamp fence.
+                            // Never let an older queued heartbeat resurrect it.
+                            lastActiveAt: { lt: new Date(update.timestamp) },
+                            ...(update.sessionInstanceId
+                                ? {
+                                    activeInstanceId: update.sessionInstanceId,
+                                    // Durable runtimes may only refresh an
+                                    // incarnation which is still active. A
+                                    // committed session-end flips this false,
+                                    // so even a clock-skewed queued heartbeat
+                                    // cannot resurrect the ended runtime.
+                                    active: true,
+                                }
+                                : {}),
+                        },
                         data: { lastActiveAt: new Date(update.timestamp), active: true }
                     })
                 ));

@@ -1,7 +1,9 @@
 import { onShutdown } from "@/utils/shutdown";
 import { Fastify } from "./types";
-import { buildMachineActivityEphemeral, ClientConnection, eventRouter } from "@/app/events/eventRouter";
-import { Server, Socket } from "socket.io";
+import { buildMachineActivityEphemeral, ClientConnection, eventRouter, getConnectionRooms } from "@/app/events/eventRouter";
+import { Server } from "socket.io";
+import { createAdapter } from "@socket.io/redis-adapter";
+import { redis } from "@/storage/redis";
 import { log } from "@/utils/log";
 import { auth } from "@/app/auth/auth";
 import { decrementWebSocketConnection, incrementWebSocketConnection, websocketEventsCounter } from "../monitoring/metrics2";
@@ -12,8 +14,30 @@ import { sessionUpdateHandler } from "./socket/sessionUpdateHandler";
 import { machineUpdateHandler } from "./socket/machineUpdateHandler";
 import { artifactUpdateHandler } from "./socket/artifactUpdateHandler";
 import { accessKeyHandler } from "./socket/accessKeyHandler";
+import { SessionMessageNotificationBus } from "@/app/session/sessionMessageNotificationBus";
+import {
+    SessionMessageNotificationDispatcher,
+    sessionMessageNotificationRepository
+} from "@/app/session/sessionMessageNotificationOutbox";
+import { parseSessionMessageLocalId } from "@/app/api/socket/sessionMessageValidation";
+import { db } from "@/storage/db";
+import type { RpcHandlerLifecycle } from "@/app/api/socket/rpcHandler";
+import { shutdownSocketRuntime } from "@/app/api/socket/shutdownSocketRuntime";
 
-export function startSocket(app: Fastify) {
+export async function startSocket(app: Fastify) {
+    const socketPublisherRedis = redis.duplicate({ lazyConnect: true });
+    const socketSubscriberRedis = redis.duplicate({ lazyConnect: true });
+    const notificationPublisherRedis = redis.duplicate({ lazyConnect: true });
+    const notificationSubscriberRedis = redis.duplicate({ lazyConnect: true });
+    const realtimeRedisClients = [
+        socketPublisherRedis,
+        socketSubscriberRedis,
+        notificationPublisherRedis,
+        notificationSubscriberRedis,
+    ];
+    // Connect each Redis transport before constructing the adapters.
+    await Promise.all(realtimeRedisClients.map((client) => client.connect()));
+    const rpcLifecycles = new Set<RpcHandlerLifecycle>();
     const io = new Server(app.server, {
         cors: {
             origin: "*",
@@ -29,7 +53,103 @@ export function startSocket(app: Fastify) {
         upgradeTimeout: 10000,
         connectTimeout: 20000,
         maxHttpBufferSize: 8 * 1024 * 1024,
-        serveClient: false // Don't serve the client files
+        serveClient: false, // Don't serve the client files
+        adapter: createAdapter(socketPublisherRedis, socketSubscriberRedis, {
+            key: process.env.SOCKET_IO_REDIS_CHANNEL_PREFIX || "happy:socket.io",
+            publishOnSpecificResponseChannel: true,
+        })
+    });
+    // The adapter constructor queues its PSUBSCRIBE/SUBSCRIBE calls without
+    // returning their promises. A PING on the same subscriber connection is an
+    // ordering barrier: when it resolves, every earlier subscription is live.
+    await socketSubscriberRedis.ping();
+    eventRouter.setServer(io);
+    const notificationBus = new SessionMessageNotificationBus(
+        notificationPublisherRedis,
+        notificationSubscriberRedis,
+        process.env.SESSION_MESSAGE_NOTIFICATION_REDIS_CHANNEL || "happy:session-message-notifications",
+        async (notification) => eventRouter.emitDurableSessionMessageLocal(notification)
+    );
+    await notificationBus.start();
+    const notificationDispatcher = new SessionMessageNotificationDispatcher(
+        sessionMessageNotificationRepository,
+        (notification) => notificationBus.publish(notification)
+    );
+    notificationDispatcher.start();
+
+    // Authenticate before CONNECT and before installing event handlers. Socket.IO
+    // connection-state recovery stays disabled because it restores rooms and
+    // emits missed packets before namespace middleware receives handshake auth.
+    io.use(async (socket, next) => {
+        try {
+            const token = socket.handshake.auth.token;
+            const clientType = socket.handshake.auth.clientType as 'session-scoped' | 'user-scoped' | 'machine-scoped' | undefined;
+            const sessionId = socket.handshake.auth.sessionId;
+            const machineId = socket.handshake.auth.machineId;
+            const parsedSessionInstanceId = parseSessionMessageLocalId(socket.handshake.auth.sessionInstanceId);
+            const replayOnly = socket.handshake.auth.replayOnly === true;
+            if (typeof token !== 'string' || token.length === 0) {
+                next(new Error('Missing authentication token'));
+                return;
+            }
+            if (clientType === 'session-scoped' && (typeof sessionId !== 'string' || sessionId.length === 0)) {
+                next(new Error('Session ID required for session-scoped clients'));
+                return;
+            }
+            if (clientType === 'machine-scoped' && (typeof machineId !== 'string' || machineId.length === 0)) {
+                next(new Error('Machine ID required for machine-scoped clients'));
+                return;
+            }
+            if (!parsedSessionInstanceId.valid) {
+                next(new Error('Invalid session instance ID'));
+                return;
+            }
+
+            const verified = await auth.verifyToken(token);
+            if (!verified) {
+                next(new Error('Invalid authentication token'));
+                return;
+            }
+            if (socket.recovered && socket.data.userId && socket.data.userId !== verified.userId) {
+                next(new Error('Recovered session account mismatch'));
+                return;
+            }
+            if (clientType === 'session-scoped'
+                && typeof sessionId === 'string'
+                && parsedSessionInstanceId.localId) {
+                // Claim the runtime incarnation before Socket.IO emits CONNECT.
+                // Awaiting this inside the connection callback would leave a
+                // window where client packets arrive before handlers exist.
+                const claimed = replayOnly
+                    ? await db.session.updateMany({
+                        where: {
+                            id: sessionId,
+                            accountId: verified.userId,
+                            activeInstanceId: null,
+                        },
+                        data: { activeInstanceId: parsedSessionInstanceId.localId },
+                    })
+                    : await db.session.updateMany({
+                        where: { id: sessionId, accountId: verified.userId },
+                        data: {
+                            activeInstanceId: parsedSessionInstanceId.localId,
+                            active: true,
+                            lastActiveAt: new Date(),
+                        },
+                    });
+                if (!replayOnly && claimed.count === 0) {
+                    next(new Error('Session not found'));
+                    return;
+                }
+            }
+            socket.data.userId = verified.userId;
+            socket.data.sessionInstanceId = parsedSessionInstanceId.localId;
+            socket.data.replayOnly = replayOnly;
+            next();
+        } catch (error) {
+            log({ module: 'websocket', level: 'error' }, `Socket authentication failed: ${error}`);
+            next(new Error('Authentication failed'));
+        }
     });
 
     io.engine.on("connection_error", (err) => {
@@ -39,46 +159,14 @@ export function startSocket(app: Fastify) {
         );
     });
 
-    let rpcListeners = new Map<string, Map<string, Socket>>();
     io.on("connection", async (socket) => {
         log({ module: 'websocket' }, `New connection attempt from socket: ${socket.id}`);
-        const token = socket.handshake.auth.token as string;
         const clientType = socket.handshake.auth.clientType as 'session-scoped' | 'user-scoped' | 'machine-scoped' | undefined;
         const sessionId = socket.handshake.auth.sessionId as string | undefined;
         const machineId = socket.handshake.auth.machineId as string | undefined;
-
-        if (!token) {
-            log({ module: 'websocket' }, `No token provided`);
-            socket.emit('error', { message: 'Missing authentication token' });
-            socket.disconnect();
-            return;
-        }
-
-        // Validate session-scoped clients have sessionId
-        if (clientType === 'session-scoped' && !sessionId) {
-            log({ module: 'websocket' }, `Session-scoped client missing sessionId`);
-            socket.emit('error', { message: 'Session ID required for session-scoped clients' });
-            socket.disconnect();
-            return;
-        }
-
-        // Validate machine-scoped clients have machineId
-        if (clientType === 'machine-scoped' && !machineId) {
-            log({ module: 'websocket' }, `Machine-scoped client missing machineId`);
-            socket.emit('error', { message: 'Machine ID required for machine-scoped clients' });
-            socket.disconnect();
-            return;
-        }
-
-        const verified = await auth.verifyToken(token);
-        if (!verified) {
-            log({ module: 'websocket' }, `Invalid token provided`);
-            socket.emit('error', { message: 'Invalid authentication token' });
-            socket.disconnect();
-            return;
-        }
-
-        const userId = verified.userId;
+        const userId = socket.data.userId as string;
+        const sessionInstanceId = socket.data.sessionInstanceId as string | null | undefined;
+        const replayOnly = socket.data.replayOnly === true;
         log({ module: 'websocket' }, `Token verified: ${userId}, clientType: ${clientType || 'user-scoped'}, sessionId: ${sessionId || 'none'}, machineId: ${machineId || 'none'}, socketId: ${socket.id}`);
 
         // Store connection based on type
@@ -89,7 +177,9 @@ export function startSocket(app: Fastify) {
                 connectionType: 'session-scoped',
                 socket,
                 userId,
-                sessionId
+                sessionId,
+                sessionInstanceId: sessionInstanceId ?? undefined,
+                replayOnly,
             };
         } else if (metadata.clientType === 'machine-scoped' && machineId) {
             connection = {
@@ -105,6 +195,7 @@ export function startSocket(app: Fastify) {
                 userId
             };
         }
+        await socket.join(getConnectionRooms(connection));
         eventRouter.addConnection(userId, connection);
         incrementWebSocketConnection(connection.connectionType);
 
@@ -140,14 +231,13 @@ export function startSocket(app: Fastify) {
         });
 
         // Handlers
-        let userRpcListeners = rpcListeners.get(userId);
-        if (!userRpcListeners) {
-            userRpcListeners = new Map<string, Socket>();
-            rpcListeners.set(userId, userRpcListeners);
-        }
-        rpcHandler(userId, socket, userRpcListeners);
+        const rpcLifecycle = rpcHandler(userId, socket);
+        rpcLifecycles.add(rpcLifecycle);
+        socket.on("disconnect", () => {
+            void rpcLifecycle.close().finally(() => rpcLifecycles.delete(rpcLifecycle));
+        });
         usageHandler(userId, socket);
-        sessionUpdateHandler(userId, socket, connection);
+        sessionUpdateHandler(userId, socket, connection, notificationDispatcher);
         pingHandler(socket);
         machineUpdateHandler(userId, socket);
         artifactUpdateHandler(userId, socket);
@@ -158,6 +248,12 @@ export function startSocket(app: Fastify) {
     });
 
     onShutdown('api', async () => {
-        await io.close();
+        await shutdownSocketRuntime({
+            io,
+            rpcLifecycles,
+            notificationDispatcher,
+            notificationBus,
+            redisClients: [...realtimeRedisClients, redis],
+        });
     });
 }

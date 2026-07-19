@@ -1,14 +1,28 @@
 import { sessionAliveEventsCounter, websocketEventsCounter } from "@/app/monitoring/metrics2";
 import { activityCache } from "@/app/presence/sessionCache";
-import { buildNewMessageUpdate, buildSessionActivityEphemeral, buildUpdateSessionUpdate, ClientConnection, eventRouter } from "@/app/events/eventRouter";
+import { buildSessionActivityEphemeral, buildUpdateSessionUpdate, ClientConnection, eventRouter } from "@/app/events/eventRouter";
 import { db } from "@/storage/db";
-import { allocateSessionSeq, allocateUserSeq } from "@/storage/seq";
+import { allocateUserSeq } from "@/storage/seq";
 import { AsyncLock } from "@/utils/lock";
 import { log } from "@/utils/log";
 import { randomKeyNaked } from "@/utils/randomKeyNaked";
 import { Socket } from "socket.io";
+import { persistSessionMessage, SessionMessageAck, toSessionMessageAck } from "@/app/session/sessionMessageCreate";
+import { SessionMessageNotificationDispatcher } from "@/app/session/sessionMessageNotificationOutbox";
+import { parseSessionMessageLocalId } from "@/app/api/socket/sessionMessageValidation";
 
-export function sessionUpdateHandler(userId: string, socket: Socket, connection: ClientConnection) {
+type SessionEndAck =
+    | { result: "success"; localId: string | null }
+    | { result: "error"; code: "invalid_request" | "session_not_found" | "internal_error"; retryable: boolean };
+
+export const MAX_SESSION_MESSAGE_CIPHERTEXT_BYTES = 7 * 1024 * 1024;
+
+export function sessionUpdateHandler(
+    userId: string,
+    socket: Socket,
+    connection: ClientConnection,
+    notificationDispatcher: SessionMessageNotificationDispatcher
+) {
     socket.on('update-metadata', async (data: any, callback: (response: any) => void) => {
         try {
             const { sid, metadata, expectedVersion } = data;
@@ -168,7 +182,13 @@ export function sessionUpdateHandler(userId: string, socket: Socket, connection:
             }
 
             // Queue database update (will only update if time difference is significant)
-            activityCache.queueSessionUpdate(sid, t);
+            activityCache.queueSessionUpdate(
+                sid,
+                t,
+                connection.connectionType === 'session-scoped'
+                    ? connection.sessionInstanceId
+                    : undefined
+            );
 
             // Emit session activity update
             const sessionActivity = buildSessionActivityEphemeral(sid, true, t, thinking || false);
@@ -183,107 +203,129 @@ export function sessionUpdateHandler(userId: string, socket: Socket, connection:
     });
 
     const receiveMessageLock = new AsyncLock();
-    socket.on('message', async (data: any) => {
+    socket.on('message', async (data: any, callback?: (response: SessionMessageAck) => void) => {
         await receiveMessageLock.inLock(async () => {
+            websocketEventsCounter.inc({ event_type: 'message' });
+            if (!data || typeof data.sid !== 'string' || data.sid.length === 0 || typeof data.message !== 'string') {
+                callback?.({ result: 'error', code: 'invalid_request', retryable: false });
+                return;
+            }
+            if (Buffer.byteLength(data.message, "utf8") > MAX_SESSION_MESSAGE_CIPHERTEXT_BYTES) {
+                callback?.({ result: 'error', code: 'invalid_request', retryable: false });
+                return;
+            }
+
+            const parsedLocalId = parseSessionMessageLocalId(data.localId);
+            if (!parsedLocalId.valid) {
+                callback?.({ result: 'error', code: 'invalid_request', retryable: false });
+                return;
+            }
+            const localId = parsedLocalId.localId;
+
+            const { sid, message } = data;
+            log(
+                { module: 'websocket' },
+                `Received message from socket ${socket.id}: sessionId=${sid}, messageLength=${message.length} bytes, hasLocalId=${localId !== null}, connectionType=${connection.connectionType}, connectionSessionId=${connection.connectionType === 'session-scoped' ? connection.sessionId : 'N/A'}`
+            );
+
             try {
-                websocketEventsCounter.inc({ event_type: 'message' });
-                const { sid, message, localId } = data;
-
-                log({ module: 'websocket' }, `Received message from socket ${socket.id}: sessionId=${sid}, messageLength=${message.length} bytes, connectionType=${connection.connectionType}, connectionSessionId=${connection.connectionType === 'session-scoped' ? connection.sessionId : 'N/A'}`);
-
-                // Resolve session
-                const session = await db.session.findUnique({
-                    where: { id: sid, accountId: userId }
-                });
-                if (!session) {
-                    return;
-                }
-                let useLocalId = typeof localId === 'string' ? localId : null;
-
-                // Create encrypted message
-                const msgContent: PrismaJson.SessionMessageContent = {
-                    t: 'encrypted',
-                    c: message
-                };
-
-                // Resolve seq
-                const updSeq = await allocateUserSeq(userId);
-                const msgSeq = await allocateSessionSeq(sid);
-
-                // Check if message already exists
-                if (useLocalId) {
-                    const existing = await db.sessionMessage.findFirst({
-                        where: { sessionId: sid, localId: useLocalId }
-                    });
-                    if (existing) {
-                        return { msg: existing, update: null };
-                    }
-                }
-
-                // Create message
-                const msg = await db.sessionMessage.create({
-                    data: {
-                        sessionId: sid,
-                        seq: msgSeq,
-                        content: msgContent,
-                        localId: useLocalId
-                    }
-                });
-
-                // Emit new message update to relevant clients
-                const updatePayload = buildNewMessageUpdate(msg, sid, updSeq, randomKeyNaked(12));
-                eventRouter.emitUpdate({
+                const result = await persistSessionMessage({
                     userId,
-                    payload: updatePayload,
-                    recipientFilter: { type: 'all-interested-in-session', sessionId: sid },
-                    skipSenderConnection: connection
+                    sessionId: sid,
+                    ciphertext: message,
+                    localId,
+                    originSocketId: socket.id
                 });
+
+                if (result.result === 'success') {
+                    // A duplicate producer retry must never reopen an already
+                    // delivered notification. Waking is harmless for a
+                    // duplicate and immediately drains any new pending row.
+                    notificationDispatcher.wake();
+                }
+
+                // persistSessionMessage returns only after its database transaction commits.
+                callback?.(toSessionMessageAck(result));
             } catch (error) {
                 log({ module: 'websocket', level: 'error' }, `Error in message handler: ${error}`);
+                callback?.({ result: 'error', code: 'internal_error', retryable: true });
             }
         });
     });
 
     socket.on('session-end', async (data: {
-        sid: string;
-        time: number;
-    }) => {
+        sid?: unknown;
+        time?: unknown;
+        localId?: unknown;
+        sessionInstanceId?: unknown;
+    }, callback?: (response: SessionEndAck) => void) => {
         try {
-            const { sid, time } = data;
-            let t = time;
-            if (typeof t !== 'number') {
+            if (!data
+                || typeof data.sid !== 'string'
+                || data.sid.length === 0
+                || typeof data.time !== 'number'
+                || !Number.isFinite(data.time)) {
+                callback?.({ result: 'error', code: 'invalid_request', retryable: false });
                 return;
             }
+            const parsedLocalId = parseSessionMessageLocalId(data.localId);
+            const parsedSessionInstanceId = parseSessionMessageLocalId(data.sessionInstanceId);
+            if (!parsedLocalId.valid
+                || !parsedSessionInstanceId.valid
+                || (parsedLocalId.localId === null) !== (parsedSessionInstanceId.localId === null)) {
+                callback?.({ result: 'error', code: 'invalid_request', retryable: false });
+                return;
+            }
+            const localId = parsedLocalId.localId;
+            const sessionInstanceId = parsedSessionInstanceId.localId;
+            const { sid, time } = data;
+            let t = time;
             if (t > Date.now()) {
                 t = Date.now();
             }
-            if (t < Date.now() - 1000 * 60 * 10) { // Ignore if time is in the past 10 minutes
-                return;
-            }
-
             // Resolve session
             const session = await db.session.findUnique({
                 where: { id: sid, accountId: userId }
             });
             if (!session) {
+                callback?.({ result: 'error', code: 'session_not_found', retryable: false });
                 return;
             }
 
-            // Update last active at
-            await db.session.update({
-                where: { id: sid },
-                data: { lastActiveAt: new Date(t), active: false }
+            const endedAt = sessionInstanceId ? Date.now() : t;
+            // Durable producers are fenced by a server-persisted runtime
+            // incarnation. Legacy producers retain the timestamp fence.
+            const ended = await db.session.updateMany({
+                where: {
+                    id: sid,
+                    accountId: userId,
+                    ...(sessionInstanceId
+                        ? {
+                            activeInstanceId: sessionInstanceId,
+                            active: true,
+                        }
+                        : { lastActiveAt: { lte: new Date(t) } }),
+                },
+                data: {
+                    lastActiveAt: new Date(endedAt),
+                    active: false,
+                }
             });
 
-            // Emit session activity update
-            const sessionActivity = buildSessionActivityEphemeral(sid, false, t, false);
-            eventRouter.emitEphemeral({
-                userId,
-                payload: sessionActivity,
-                recipientFilter: { type: 'user-scoped-only' }
-            });
+            if (ended.count > 0) {
+                // Emit session activity update only when this marker actually
+                // won the timestamp fence. Stale retries are successful no-ops.
+                const sessionActivity = buildSessionActivityEphemeral(sid, false, endedAt, false);
+                eventRouter.emitEphemeral({
+                    userId,
+                    payload: sessionActivity,
+                    recipientFilter: { type: 'user-scoped-only' }
+                });
+            }
+            callback?.({ result: 'success', localId });
         } catch (error) {
             log({ module: 'websocket', level: 'error' }, `Error in session-end: ${error}`);
+            callback?.({ result: 'error', code: 'internal_error', retryable: true });
         }
     });
 

@@ -23,7 +23,11 @@ data:
     save 900 1
     save 300 10
     save 60 10000
-    maxmemory-policy noeviction
+    # Pub/Sub is intentionally lossy and retained RPC registrations all carry
+    # TTLs, so pressure should evict the soonest-expiring registry keys rather
+    # than letting Redis exceed the pod's memory limit.
+    maxmemory 384mb
+    maxmemory-policy volatile-ttl
 ---
 apiVersion: apps/v1
 kind: StatefulSet

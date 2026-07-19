@@ -65,7 +65,7 @@ export ANSIBLE_INFRA_OPS_PATH=/Volumes/AppleFS/kDrive/Documents/workspace/ansibl
 
 ### 6. Create external volumes on server
 
-Volumes are `external: true` to prevent accidental deletion with `docker compose down -v`.
+Postgres and MinIO volumes are `external: true` to prevent accidental deletion with `docker compose down -v`. Redis uses the Compose-managed named volume `happy_redis_data`, which is created automatically on the first deploy.
 
 ```bash
 ssh g@ov8374 "docker volume create happy_postgres_data && docker volume create happy_minio_data"
@@ -78,6 +78,11 @@ Push to `master` branch triggers automatic build and deploy:
 ```bash
 git push sn1994 master
 ```
+
+Realtime reliability releases that introduce the message outbox, Pub/Sub rooms,
+or runtime-incarnation fencing are not compatible with old server pods. Apply
+the additive Prisma migrations first, then drain all old pods before routing
+clients to the new version; do not run a mixed-version realtime fleet.
 
 ## Updating Secrets
 
