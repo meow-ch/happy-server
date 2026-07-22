@@ -229,7 +229,7 @@ export function sessionRoutes(app: Fastify) {
         preHandler: app.authenticate
     }, async (request, reply) => {
         const userId = request.userId;
-        const { tag, metadata, dataEncryptionKey } = request.body;
+        const { tag, metadata, agentState, dataEncryptionKey } = request.body;
 
         const session = await db.session.findFirst({
             where: {
@@ -267,6 +267,8 @@ export function sessionRoutes(app: Fastify) {
                     accountId: userId,
                     tag: tag,
                     metadata: metadata,
+                    agentState: agentState ?? null,
+                    agentStateVersion: agentState == null ? 0 : 1,
                     dataEncryptionKey: dataEncryptionKey ? new Uint8Array(Buffer.from(dataEncryptionKey, 'base64')) : undefined
                 }
             });
@@ -321,6 +323,7 @@ export function sessionRoutes(app: Fastify) {
                     session: z.object({
                         id: z.string(),
                         agentStateVersion: z.number().int(),
+                        runtimeConnected: z.boolean(),
                         dataEncryptionKey: z.string().nullable()
                     })
                 }),
@@ -345,6 +348,7 @@ export function sessionRoutes(app: Fastify) {
             select: {
                 id: true,
                 agentStateVersion: true,
+                activeInstanceId: true,
                 dataEncryptionKey: true
             }
         });
@@ -360,6 +364,7 @@ export function sessionRoutes(app: Fastify) {
             session: {
                 id: session.id,
                 agentStateVersion: session.agentStateVersion,
+                runtimeConnected: session.activeInstanceId !== null,
                 dataEncryptionKey: session.dataEncryptionKey === null
                     ? null
                     : Buffer.from(session.dataEncryptionKey).toString('base64')

@@ -5,13 +5,18 @@ import type { Fastify } from "../types";
 
 const mocks = vi.hoisted(() => ({
     sessionFindFirst: vi.fn(),
-    sessionMessageFindMany: vi.fn()
+    sessionCreate: vi.fn(),
+    sessionMessageFindMany: vi.fn(),
+    allocateUserSeq: vi.fn(),
+    emitUpdate: vi.fn(),
+    buildNewSessionUpdate: vi.fn()
 }));
 
 vi.mock("@/storage/db", () => ({
     db: {
         session: {
-            findFirst: mocks.sessionFindFirst
+            findFirst: mocks.sessionFindFirst,
+            create: mocks.sessionCreate
         },
         sessionMessage: {
             findMany: mocks.sessionMessageFindMany
@@ -20,11 +25,11 @@ vi.mock("@/storage/db", () => ({
 }));
 
 vi.mock("@/app/events/eventRouter", () => ({
-    eventRouter: { emitUpdate: vi.fn() },
-    buildNewSessionUpdate: vi.fn()
+    eventRouter: { emitUpdate: mocks.emitUpdate },
+    buildNewSessionUpdate: mocks.buildNewSessionUpdate
 }));
 
-vi.mock("@/storage/seq", () => ({ allocateUserSeq: vi.fn() }));
+vi.mock("@/storage/seq", () => ({ allocateUserSeq: mocks.allocateUserSeq }));
 vi.mock("@/app/session/sessionDelete", () => ({ sessionDelete: vi.fn() }));
 
 import { sessionRoutes } from "./sessionRoutes";
@@ -56,9 +61,154 @@ function oldInactiveSession() {
         agentStateVersion: 5,
         dataEncryptionKey: new Uint8Array([1, 2, 3, 4]),
         active: false,
+        activeInstanceId: null,
         lastActiveAt: new Date("2026-06-18T12:07:00.000Z")
     };
 }
+
+function newSession(overrides: Record<string, unknown> = {}) {
+    return {
+        id: "session-new",
+        seq: 0,
+        createdAt: new Date("2026-07-22T15:24:11.000Z"),
+        updatedAt: new Date("2026-07-22T15:24:11.000Z"),
+        metadata: "encrypted-metadata",
+        metadataVersion: 0,
+        agentState: null,
+        agentStateVersion: 0,
+        dataEncryptionKey: null,
+        active: true,
+        activeInstanceId: null,
+        lastActiveAt: new Date("2026-07-22T15:24:11.000Z"),
+        ...overrides
+    };
+}
+
+describe("POST /v1/sessions", () => {
+    beforeEach(() => {
+        mocks.sessionFindFirst.mockReset();
+        mocks.sessionCreate.mockReset();
+        mocks.allocateUserSeq.mockReset();
+        mocks.emitUpdate.mockReset();
+        mocks.buildNewSessionUpdate.mockReset();
+        mocks.allocateUserSeq.mockResolvedValue(42);
+        mocks.buildNewSessionUpdate.mockReturnValue({ type: "new-session" });
+    });
+
+    afterEach(async () => {
+        await Promise.all(openApps.splice(0).map((app) => app.close()));
+    });
+
+    it("persists a supplied encrypted initial agent state at version one", async () => {
+        const encryptedKey = Buffer.from([9, 8, 7, 6]).toString("base64");
+        mocks.sessionFindFirst.mockResolvedValue(null);
+        mocks.sessionCreate.mockResolvedValue(newSession({
+            agentState: "encrypted-initial-state",
+            agentStateVersion: 1,
+            dataEncryptionKey: new Uint8Array([9, 8, 7, 6])
+        }));
+        const app = await createApp("account-owner");
+
+        const response = await app.inject({
+            method: "POST",
+            url: "/v1/sessions",
+            payload: {
+                tag: "durable-session-tag",
+                metadata: "encrypted-metadata",
+                agentState: "encrypted-initial-state",
+                dataEncryptionKey: encryptedKey
+            }
+        });
+
+        expect(response.statusCode).toBe(200);
+        expect(mocks.sessionCreate).toHaveBeenCalledWith({
+            data: {
+                accountId: "account-owner",
+                tag: "durable-session-tag",
+                metadata: "encrypted-metadata",
+                agentState: "encrypted-initial-state",
+                agentStateVersion: 1,
+                dataEncryptionKey: new Uint8Array([9, 8, 7, 6])
+            }
+        });
+        expect(response.json().session).toMatchObject({
+            id: "session-new",
+            agentState: "encrypted-initial-state",
+            agentStateVersion: 1,
+            dataEncryptionKey: encryptedKey
+        });
+        expect(mocks.emitUpdate).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([
+        ["omitted", {}],
+        ["null", { agentState: null }]
+    ])("persists null agent state at version zero when it is %s", async (_label, extraPayload) => {
+        mocks.sessionFindFirst.mockResolvedValue(null);
+        mocks.sessionCreate.mockResolvedValue(newSession());
+        const app = await createApp("account-owner");
+
+        const response = await app.inject({
+            method: "POST",
+            url: "/v1/sessions",
+            payload: {
+                tag: "durable-session-tag",
+                metadata: "encrypted-metadata",
+                ...extraPayload
+            }
+        });
+
+        expect(response.statusCode).toBe(200);
+        expect(mocks.sessionCreate).toHaveBeenCalledWith({
+            data: {
+                accountId: "account-owner",
+                tag: "durable-session-tag",
+                metadata: "encrypted-metadata",
+                agentState: null,
+                agentStateVersion: 0,
+                dataEncryptionKey: undefined
+            }
+        });
+        expect(response.json().session).toMatchObject({
+            agentState: null,
+            agentStateVersion: 0
+        });
+    });
+
+    it("returns an existing tagged session without overwriting its state", async () => {
+        mocks.sessionFindFirst.mockResolvedValue(newSession({
+            id: "session-existing",
+            metadata: "original-metadata",
+            agentState: "original-agent-state",
+            agentStateVersion: 7,
+            dataEncryptionKey: new Uint8Array([1, 2, 3, 4])
+        }));
+        const app = await createApp("account-owner");
+
+        const response = await app.inject({
+            method: "POST",
+            url: "/v1/sessions",
+            payload: {
+                tag: "durable-session-tag",
+                metadata: "replacement-metadata",
+                agentState: "replacement-agent-state",
+                dataEncryptionKey: Buffer.from([9, 9, 9, 9]).toString("base64")
+            }
+        });
+
+        expect(response.statusCode).toBe(200);
+        expect(response.json().session).toMatchObject({
+            id: "session-existing",
+            metadata: "original-metadata",
+            agentState: "original-agent-state",
+            agentStateVersion: 7,
+            dataEncryptionKey: Buffer.from([1, 2, 3, 4]).toString("base64")
+        });
+        expect(mocks.sessionCreate).not.toHaveBeenCalled();
+        expect(mocks.allocateUserSeq).not.toHaveBeenCalled();
+        expect(mocks.emitUpdate).not.toHaveBeenCalled();
+    });
+});
 
 describe("GET /v1/sessions/:sessionId", () => {
     beforeEach(() => {
@@ -86,6 +236,7 @@ describe("GET /v1/sessions/:sessionId", () => {
             session: {
                 id: "session-old",
                 agentStateVersion: 5,
+                runtimeConnected: false,
                 dataEncryptionKey: Buffer.from([1, 2, 3, 4]).toString("base64")
             }
         });
@@ -96,9 +247,26 @@ describe("GET /v1/sessions/:sessionId", () => {
             select: {
                 id: true,
                 agentStateVersion: true,
+                activeInstanceId: true,
                 dataEncryptionKey: true
             }
         }));
+    });
+
+    it("reports a claimed CLI session incarnation as runtime connected", async () => {
+        mocks.sessionFindFirst.mockResolvedValue({
+            ...oldInactiveSession(),
+            activeInstanceId: "8c46b5ad-4155-47ed-a470-d21c7be49baf"
+        });
+        const app = await createApp("account-owner");
+
+        const response = await app.inject({
+            method: "GET",
+            url: "/v1/sessions/session-old"
+        });
+
+        expect(response.statusCode).toBe(200);
+        expect(response.json().session.runtimeConnected).toBe(true);
     });
 
     it("returns 404 for a session owned by another account", async () => {
