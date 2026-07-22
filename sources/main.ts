@@ -16,11 +16,9 @@ async function main() {
 
     // Storage
     await db.$connect();
-    onShutdown('db', async () => {
+    onShutdown('storage', async () => {
+        await activityCache.shutdown();
         await db.$disconnect();
-    });
-    onShutdown('activity-cache', async () => {
-        activityCache.shutdown();
     });
     await redis.ping();
 

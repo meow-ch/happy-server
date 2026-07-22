@@ -2,7 +2,8 @@ import { db } from "@/storage/db";
 import { delay } from "@/utils/delay";
 import { forever } from "@/utils/forever";
 import { shutdownSignal } from "@/utils/shutdown";
-import { buildMachineActivityEphemeral, buildSessionActivityEphemeral, eventRouter } from "@/app/events/eventRouter";
+import { buildMachineActivityEphemeral, eventRouter } from "@/app/events/eventRouter";
+import { sessionActivityPublisher } from "@/app/presence/sessionActivityPublisher";
 
 export function startTimeout() {
     forever('session-timeout', async () => {
@@ -24,10 +25,12 @@ export function startTimeout() {
                 if (updated.length === 0) {
                     continue;
                 }
-                eventRouter.emitEphemeral({
+                sessionActivityPublisher.publish({
                     userId: session.accountId,
-                    payload: buildSessionActivityEphemeral(session.id, false, updated[0].lastActiveAt.getTime(), false),
-                    recipientFilter: { type: 'user-scoped-only' }
+                    sessionId: session.id,
+                    active: false,
+                    activeAt: updated[0].lastActiveAt.getTime(),
+                    thinking: false,
                 });
             }
 

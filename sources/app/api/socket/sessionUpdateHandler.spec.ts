@@ -6,7 +6,10 @@ const mocks = vi.hoisted(() => ({
     log: vi.fn(),
     sessionFindUnique: vi.fn(),
     sessionUpdateMany: vi.fn(),
-    emitEphemeral: vi.fn()
+    emitEphemeral: vi.fn(),
+    isSessionValid: vi.fn(),
+    queueSessionUpdate: vi.fn(),
+    publishSessionActivity: vi.fn()
 }));
 
 vi.mock("@/app/monitoring/metrics2", () => ({
@@ -14,7 +17,13 @@ vi.mock("@/app/monitoring/metrics2", () => ({
     websocketEventsCounter: { inc: vi.fn() }
 }));
 vi.mock("@/app/presence/sessionCache", () => ({
-    activityCache: { isSessionValid: vi.fn(), queueSessionUpdate: vi.fn() }
+    activityCache: {
+        isSessionValid: mocks.isSessionValid,
+        queueSessionUpdate: mocks.queueSessionUpdate
+    }
+}));
+vi.mock("@/app/presence/sessionActivityPublisher", () => ({
+    sessionActivityPublisher: { publish: mocks.publishSessionActivity }
 }));
 vi.mock("@/app/events/eventRouter", () => ({
     buildSessionActivityEphemeral: vi.fn(),
@@ -85,6 +94,9 @@ describe("session message socket handler", () => {
         mocks.sessionFindUnique.mockReset();
         mocks.sessionUpdateMany.mockReset();
         mocks.emitEphemeral.mockReset();
+        mocks.isSessionValid.mockReset();
+        mocks.queueSessionUpdate.mockReset();
+        mocks.publishSessionActivity.mockReset();
     });
 
     it("preserves socket receive order while asynchronous commits are in flight", async () => {
@@ -175,6 +187,27 @@ describe("session message socket handler", () => {
         expect(callback).toHaveBeenCalledWith({ result: "success" });
     });
 
+    it("queues every valid heartbeat but delegates Redis publication to the coalescer", async () => {
+        mocks.isSessionValid.mockResolvedValue(true);
+        const { handlers } = createHarness();
+        const heartbeatAt = Date.now();
+
+        await handlers.get("session-alive")?.({
+            sid: "session-1",
+            time: heartbeatAt,
+            thinking: true
+        });
+
+        expect(mocks.queueSessionUpdate).toHaveBeenCalledWith("session-1", heartbeatAt, undefined);
+        expect(mocks.publishSessionActivity).toHaveBeenCalledWith({
+            userId: "account-1",
+            sessionId: "session-1",
+            active: true,
+            activeAt: heartbeatAt,
+            thinking: true
+        });
+    });
+
     it("acknowledges session-end only after the inactive state is persisted", async () => {
         const localId = "16cc3995-c10f-43c0-8dbd-95ef41f924a7";
         mocks.sessionFindUnique.mockResolvedValue({ id: "session-1" });
@@ -238,6 +271,6 @@ describe("session message socket handler", () => {
         }, callback);
 
         expect(callback).toHaveBeenCalledWith({ result: "success", localId });
-        expect(mocks.emitEphemeral).not.toHaveBeenCalled();
+        expect(mocks.publishSessionActivity).not.toHaveBeenCalled();
     });
 });

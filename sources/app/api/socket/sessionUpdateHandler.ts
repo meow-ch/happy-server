@@ -1,6 +1,7 @@
 import { sessionAliveEventsCounter, websocketEventsCounter } from "@/app/monitoring/metrics2";
 import { activityCache } from "@/app/presence/sessionCache";
-import { buildSessionActivityEphemeral, buildUpdateSessionUpdate, ClientConnection, eventRouter } from "@/app/events/eventRouter";
+import { buildUpdateSessionUpdate, ClientConnection, eventRouter } from "@/app/events/eventRouter";
+import { sessionActivityPublisher } from "@/app/presence/sessionActivityPublisher";
 import { db } from "@/storage/db";
 import { allocateUserSeq } from "@/storage/seq";
 import { AsyncLock } from "@/utils/lock";
@@ -190,12 +191,13 @@ export function sessionUpdateHandler(
                     : undefined
             );
 
-            // Emit session activity update
-            const sessionActivity = buildSessionActivityEphemeral(sid, true, t, thinking || false);
-            eventRouter.emitEphemeral({
+            // Coalesce unchanged heartbeats before cross-node Redis fanout.
+            sessionActivityPublisher.publish({
                 userId,
-                payload: sessionActivity,
-                recipientFilter: { type: 'user-scoped-only' }
+                sessionId: sid,
+                active: true,
+                activeAt: t,
+                thinking: thinking || false,
             });
         } catch (error) {
             log({ module: 'websocket', level: 'error' }, `Error in session-alive: ${error}`);
@@ -315,11 +317,12 @@ export function sessionUpdateHandler(
             if (ended.count > 0) {
                 // Emit session activity update only when this marker actually
                 // won the timestamp fence. Stale retries are successful no-ops.
-                const sessionActivity = buildSessionActivityEphemeral(sid, false, endedAt, false);
-                eventRouter.emitEphemeral({
+                sessionActivityPublisher.publish({
                     userId,
-                    payload: sessionActivity,
-                    recipientFilter: { type: 'user-scoped-only' }
+                    sessionId: sid,
+                    active: false,
+                    activeAt: endedAt,
+                    thinking: false,
                 });
             }
             callback?.({ result: 'success', localId });

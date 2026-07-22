@@ -8,6 +8,10 @@ vi.mock("@/storage/redis", () => ({
     },
 }));
 vi.mock("@/utils/log", () => ({ log: vi.fn() }));
+vi.mock("@/app/monitoring/metrics2", () => ({
+    rpcRegistrationRefreshCounter: { inc: vi.fn() },
+    rpcRegistrationRefreshBatchSizeHistogram: { observe: vi.fn() },
+}));
 
 import {
     getRpcRegistrationKey,
@@ -28,26 +32,29 @@ class FakeRedis {
     readonly eval = vi.fn(async (
         _script: string,
         numberOfKeys: number,
-        key: string,
-        expectedValue: string,
-        ttlMs?: number,
+        ...args: Array<string | number>
     ) => {
-        expect(numberOfKeys).toBe(1);
-        if (ttlMs !== undefined) {
-            const current = this.values.get(key);
-            if (current !== undefined && current !== expectedValue) {
-                const currentGeneration = JSON.parse(current).generation;
-                const expectedGeneration = JSON.parse(expectedValue).generation;
-                if (currentGeneration >= expectedGeneration) return 0;
+        const keys = args.slice(0, numberOfKeys) as string[];
+        const expectedValues = args.slice(numberOfKeys, numberOfKeys * 2) as string[];
+        const ttlMs = args[numberOfKeys * 2] as number | undefined;
+        return keys.map((key, index) => {
+            const expectedValue = expectedValues[index];
+            if (ttlMs !== undefined) {
+                const current = this.values.get(key);
+                if (current !== undefined && current !== expectedValue) {
+                    const currentGeneration = JSON.parse(current).generation;
+                    const expectedGeneration = JSON.parse(expectedValue).generation;
+                    if (currentGeneration >= expectedGeneration) return 0;
+                }
+                this.values.set(key, expectedValue);
+                this.ttlByKey.set(key, ttlMs);
+                return 1;
             }
-            this.values.set(key, expectedValue);
-            this.ttlByKey.set(key, ttlMs);
+            if (this.values.get(key) !== expectedValue) return 0;
+            this.values.delete(key);
+            this.ttlByKey.delete(key);
             return 1;
-        }
-        if (this.values.get(key) !== expectedValue) return 0;
-        this.values.delete(key);
-        this.ttlByKey.delete(key);
-        return 1;
+        });
     });
 }
 
@@ -153,6 +160,60 @@ describe("RedisRpcRegistrationRegistry", () => {
         } finally {
             vi.useRealTimers();
         }
+    });
+
+    it("refreshes and closes every method for a socket with one Redis command per operation", async () => {
+        vi.useFakeTimers();
+        try {
+            const redis = new FakeRedis();
+            const registry = new RedisRpcRegistrationRegistry(redis as never, 60);
+            const lifecycle = new RpcRegistrationLifecycle(
+                "account-1",
+                "socket-1",
+                registry,
+                20,
+            );
+
+            await lifecycle.register("method-1");
+            await lifecycle.register("method-2");
+            await lifecycle.register("method-3");
+            await vi.advanceTimersByTimeAsync(20);
+
+            expect(redis.eval).toHaveBeenCalledTimes(1);
+            expect(redis.eval.mock.calls[0][1]).toBe(3);
+            expect([...redis.ttlByKey.values()]).toEqual([60, 60, 60]);
+
+            await lifecycle.close();
+            expect(redis.eval).toHaveBeenCalledTimes(2);
+            expect(redis.eval.mock.calls[1][1]).toBe(3);
+            expect(redis.values.size).toBe(0);
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it("coalesces overlapping refresh ticks while Redis is slow", async () => {
+        let resolveRefresh!: (value: Array<0 | 1>) => void;
+        const redis = new FakeRedis();
+        const registry = new RedisRpcRegistrationRegistry(redis as never, 60_000);
+        const lifecycle = new RpcRegistrationLifecycle(
+            "account-1",
+            "socket-1",
+            registry,
+            20_000,
+        );
+        await lifecycle.register("method-1");
+        await lifecycle.register("method-2");
+        redis.eval.mockImplementationOnce(() => new Promise(resolve => { resolveRefresh = resolve; }));
+
+        const firstRefresh = lifecycle.refresh();
+        const overlappingRefresh = lifecycle.refresh();
+        expect(overlappingRefresh).toBe(firstRefresh);
+        await vi.waitFor(() => expect(redis.eval).toHaveBeenCalledTimes(1));
+
+        resolveRefresh([1, 1]);
+        await firstRefresh;
+        await lifecycle.close();
     });
 
     it("treats malformed registry values as unavailable", async () => {

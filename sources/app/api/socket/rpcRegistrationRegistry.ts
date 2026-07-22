@@ -2,6 +2,10 @@ import { randomUUID, createHash } from "node:crypto";
 import { redis } from "@/storage/redis";
 import { log } from "@/utils/log";
 import type { Redis } from "ioredis";
+import {
+    rpcRegistrationRefreshBatchSizeHistogram,
+    rpcRegistrationRefreshCounter,
+} from "@/app/monitoring/metrics2";
 
 const DEFAULT_REGISTRATION_TTL_MS = 60_000;
 const DEFAULT_REFRESH_INTERVAL_MS = 20_000;
@@ -9,39 +13,53 @@ const DEFAULT_MAX_REGISTRATIONS_PER_SOCKET = 256;
 const REGISTRY_KEY_PREFIX = "happy:rpc-registration:v1";
 const REGISTRATION_GENERATION_PATTERN = /^\d{16}:\d{8}:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-const REFRESH_IF_CURRENT_SCRIPT = `
-local current = redis.call("GET", KEYS[1])
-if current == ARGV[1] then
-    return redis.call("PEXPIRE", KEYS[1], ARGV[2])
-end
-if not current then
-    local reclaimed = redis.call("SET", KEYS[1], ARGV[1], "PX", ARGV[2], "NX")
-    if reclaimed then
-        return 1
+const REFRESH_CURRENT_BATCH_SCRIPT = `
+local ttl = ARGV[#ARGV]
+local results = {}
+for index, key in ipairs(KEYS) do
+    local candidate = ARGV[index]
+    local current = redis.call("GET", key)
+    if current == candidate then
+        results[index] = redis.call("PEXPIRE", key, ttl)
+    elseif not current then
+        local reclaimed = redis.call("SET", key, candidate, "PX", ttl, "NX")
+        if reclaimed then
+            results[index] = 1
+        else
+            current = redis.call("GET", key)
+        end
     end
-    current = redis.call("GET", KEYS[1])
-end
 
-local current_ok, current_target = pcall(cjson.decode, current)
-local candidate_ok, candidate_target = pcall(cjson.decode, ARGV[1])
-if current_ok and candidate_ok
-    and type(current_target) == "table"
-    and type(candidate_target) == "table"
-    and type(current_target["generation"]) == "string"
-    and type(candidate_target["generation"]) == "string"
-    and current_target["generation"] < candidate_target["generation"] then
-    redis.call("SET", KEYS[1], ARGV[1], "PX", ARGV[2])
-    return 1
+    if results[index] == nil then
+        local current_ok, current_target = pcall(cjson.decode, current)
+        local candidate_ok, candidate_target = pcall(cjson.decode, candidate)
+        if current_ok and candidate_ok
+            and type(current_target) == "table"
+            and type(candidate_target) == "table"
+            and type(current_target["generation"]) == "string"
+            and type(candidate_target["generation"]) == "string"
+            and current_target["generation"] < candidate_target["generation"] then
+            redis.call("SET", key, candidate, "PX", ttl)
+            results[index] = 1
+        else
+            results[index] = 0
+        end
+    end
 end
-return 0
+return results
 `;
 
-const DELETE_IF_CURRENT_SCRIPT = `
-local current = redis.call("GET", KEYS[1])
-if current == ARGV[1] then
-    return redis.call("DEL", KEYS[1])
+const DELETE_CURRENT_BATCH_SCRIPT = `
+local results = {}
+for index, key in ipairs(KEYS) do
+    local current = redis.call("GET", key)
+    if current == ARGV[index] then
+        results[index] = redis.call("DEL", key)
+    else
+        results[index] = 0
+    end
 end
-return 0
+return results
 `;
 
 type RedisCommands = Pick<Redis, "get" | "set" | "eval">;
@@ -141,24 +159,40 @@ export class RedisRpcRegistrationRegistry {
     }
 
     async refresh(registration: RpcRegistration): Promise<boolean> {
+        return (await this.refreshMany([registration]))[0] ?? false;
+    }
+
+    async refreshMany(registrations: RpcRegistration[]): Promise<boolean[]> {
+        if (registrations.length === 0) return [];
         const result = await this.client.eval(
-            REFRESH_IF_CURRENT_SCRIPT,
-            1,
-            registration.key,
-            encodeTarget(registration),
+            REFRESH_CURRENT_BATCH_SCRIPT,
+            registrations.length,
+            ...registrations.map(registration => registration.key),
+            ...registrations.map(encodeTarget),
             this.ttlMs,
         );
-        return Number(result) === 1;
+        if (!Array.isArray(result) || result.length !== registrations.length) {
+            throw new Error("Invalid batched RPC registration refresh response");
+        }
+        return registrations.map((_registration, index) => Number(result[index]) === 1);
     }
 
     async unregister(registration: RpcRegistration): Promise<boolean> {
+        return (await this.unregisterMany([registration]))[0] ?? false;
+    }
+
+    async unregisterMany(registrations: RpcRegistration[]): Promise<boolean[]> {
+        if (registrations.length === 0) return [];
         const result = await this.client.eval(
-            DELETE_IF_CURRENT_SCRIPT,
-            1,
-            registration.key,
-            encodeTarget(registration),
+            DELETE_CURRENT_BATCH_SCRIPT,
+            registrations.length,
+            ...registrations.map(registration => registration.key),
+            ...registrations.map(encodeTarget),
         );
-        return Number(result) === 1;
+        if (!Array.isArray(result) || result.length !== registrations.length) {
+            throw new Error("Invalid batched RPC registration removal response");
+        }
+        return registrations.map((_registration, index) => Number(result[index]) === 1);
     }
 }
 
@@ -172,6 +206,7 @@ export const rpcRegistrationRegistry = new RedisRpcRegistrationRegistry(redis);
 export class RpcRegistrationLifecycle {
     private readonly registrations = new Map<string, RpcRegistration>();
     private operationTail: Promise<void> = Promise.resolve();
+    private refreshPromise: Promise<void> | undefined;
     private refreshTimer: ReturnType<typeof setInterval> | undefined;
     private closing = false;
     private closePromise: Promise<void> | undefined;
@@ -219,28 +254,40 @@ export class RpcRegistrationLifecycle {
 
     /** Refresh immediately; exported primarily for lifecycle wiring and tests. */
     refresh(): Promise<void> {
-        return this.runExclusive(async () => {
+        if (this.refreshPromise) return this.refreshPromise;
+        const refreshPromise = this.runExclusive(async () => {
             if (this.closing) return;
             const registrations = [...this.registrations.entries()];
-            const results = await Promise.allSettled(
-                registrations.map(([, registration]) => this.registry.refresh(registration)),
-            );
-
-            results.forEach((result, index) => {
-                const [method, registration] = registrations[index];
-                if (result.status === "rejected") {
-                    log(
-                        { module: "websocket-rpc", level: "error" },
-                        `Failed to refresh RPC registration for socket ${this.socketId}: ${result.reason}`,
-                    );
-                    return;
-                }
-                if (!result.value && this.registrations.get(method)?.generation === registration.generation) {
-                    this.registrations.delete(method);
-                }
-            });
-            this.stopRefreshTimerIfIdle();
+            if (registrations.length === 0) return;
+            rpcRegistrationRefreshBatchSizeHistogram.observe(registrations.length);
+            try {
+                const results = await this.registry.refreshMany(
+                    registrations.map(([, registration]) => registration),
+                );
+                rpcRegistrationRefreshCounter.inc({ result: "batch_success" });
+                results.forEach((isCurrent, index) => {
+                    const [method, registration] = registrations[index];
+                    if (!isCurrent && this.registrations.get(method)?.generation === registration.generation) {
+                        this.registrations.delete(method);
+                        rpcRegistrationRefreshCounter.inc({ result: "registration_lost" });
+                    } else if (isCurrent) {
+                        rpcRegistrationRefreshCounter.inc({ result: "registration_refreshed" });
+                    }
+                });
+            } catch (error) {
+                rpcRegistrationRefreshCounter.inc({ result: "batch_failure" });
+                log(
+                    { module: "websocket-rpc", level: "error" },
+                    `Failed to refresh RPC registrations for socket ${this.socketId}: ${error}`,
+                );
+            } finally {
+                this.stopRefreshTimerIfIdle();
+            }
+        }).finally(() => {
+            this.refreshPromise = undefined;
         });
+        this.refreshPromise = refreshPromise;
+        return refreshPromise;
     }
 
     /** Compare-delete every registration owned by this socket and stop heartbeats. */
@@ -251,16 +298,13 @@ export class RpcRegistrationLifecycle {
         this.closePromise = this.runExclusive(async () => {
             const registrations = [...this.registrations.values()];
             this.registrations.clear();
-            const results = await Promise.allSettled(
-                registrations.map((registration) => this.registry.unregister(registration)),
-            );
-            for (const result of results) {
-                if (result.status === "rejected") {
-                    log(
-                        { module: "websocket-rpc", level: "error" },
-                        `Failed to remove RPC registration for socket ${this.socketId}: ${result.reason}`,
-                    );
-                }
+            try {
+                await this.registry.unregisterMany(registrations);
+            } catch (error) {
+                log(
+                    { module: "websocket-rpc", level: "error" },
+                    `Failed to remove RPC registrations for socket ${this.socketId}: ${error}`,
+                );
             }
         });
         return this.closePromise;

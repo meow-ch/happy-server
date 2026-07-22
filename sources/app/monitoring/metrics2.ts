@@ -18,6 +18,13 @@ export const sessionAliveEventsCounter = new Counter({
     registers: [register]
 });
 
+export const sessionActivityPublicationsCounter = new Counter({
+    name: 'session_activity_publications_total',
+    help: 'Session activity publications and heartbeats coalesced before Redis fanout',
+    labelNames: ['result', 'reason'] as const,
+    registers: [register]
+});
+
 export const machineAliveEventsCounter = new Counter({
     name: 'machine_alive_events_total',
     help: 'Total number of machine-alive events',
@@ -35,6 +42,54 @@ export const databaseUpdatesSkippedCounter = new Counter({
     name: 'database_updates_skipped_total',
     help: 'Number of database updates skipped due to debouncing',
     labelNames: ['type'] as const,
+    registers: [register]
+});
+
+export const activityCacheFlushCounter = new Counter({
+    name: 'activity_cache_flushes_total',
+    help: 'Activity cache flush lifecycle outcomes',
+    labelNames: ['result'] as const,
+    registers: [register]
+});
+
+export const activityCacheDatabaseUpdatesCounter = new Counter({
+    name: 'activity_cache_database_updates_total',
+    help: 'Activity cache database update outcomes',
+    labelNames: ['type', 'result'] as const,
+    registers: [register]
+});
+
+export const activityCachePendingUpdatesGauge = new Gauge({
+    name: 'activity_cache_pending_updates',
+    help: 'Activity updates currently pending in memory',
+    labelNames: ['type'] as const,
+    registers: [register]
+});
+
+export const activityCacheFlushInProgressGauge = new Gauge({
+    name: 'activity_cache_flush_in_progress',
+    help: 'Whether an activity cache flush is currently running',
+    registers: [register]
+});
+
+export const activityCacheFlushDurationHistogram = new Histogram({
+    name: 'activity_cache_flush_duration_seconds',
+    help: 'Duration of single-flight activity cache flushes',
+    buckets: [0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5, 10],
+    registers: [register]
+});
+
+export const rpcRegistrationRefreshCounter = new Counter({
+    name: 'rpc_registration_refreshes_total',
+    help: 'RPC registration lease refresh outcomes',
+    labelNames: ['result'] as const,
+    registers: [register]
+});
+
+export const rpcRegistrationRefreshBatchSizeHistogram = new Histogram({
+    name: 'rpc_registration_refresh_batch_size',
+    help: 'Number of RPC methods refreshed in one Redis command',
+    buckets: [1, 2, 4, 8, 16, 32, 64, 128, 256],
     registers: [register]
 });
 
