@@ -306,6 +306,67 @@ export function sessionRoutes(app: Fastify) {
         }
     });
 
+    // Fetch a single session by ID. Unlike the bounded session list, this
+    // endpoint deliberately includes inactive and old sessions so durable
+    // replay consumers can recover the session encryption key after a long
+    // disconnect. Keep the account predicate in the lookup so callers cannot
+    // distinguish another account's session from a missing session.
+    app.get('/v1/sessions/:sessionId', {
+        schema: {
+            params: z.object({
+                sessionId: z.string()
+            }),
+            response: {
+                200: z.object({
+                    session: z.object({
+                        id: z.string(),
+                        agentStateVersion: z.number().int(),
+                        dataEncryptionKey: z.string().nullable()
+                    })
+                }),
+                404: z.object({
+                    error: z.literal('Session not found'),
+                    code: z.literal('SESSION_NOT_FOUND')
+                })
+            }
+        },
+        preHandler: app.authenticate
+    }, async (request, reply) => {
+        const userId = request.userId;
+        const { sessionId } = request.params;
+        reply.header('Cache-Control', 'private, no-store');
+        reply.header('Vary', 'Authorization');
+
+        const session = await db.session.findFirst({
+            where: {
+                id: sessionId,
+                accountId: userId
+            },
+            select: {
+                id: true,
+                agentStateVersion: true,
+                dataEncryptionKey: true
+            }
+        });
+
+        if (!session) {
+            return reply.code(404).send({
+                error: 'Session not found',
+                code: 'SESSION_NOT_FOUND'
+            });
+        }
+
+        return reply.send({
+            session: {
+                id: session.id,
+                agentStateVersion: session.agentStateVersion,
+                dataEncryptionKey: session.dataEncryptionKey === null
+                    ? null
+                    : Buffer.from(session.dataEncryptionKey).toString('base64')
+            }
+        });
+    });
+
     app.get('/v1/sessions/:sessionId/messages', {
         schema: {
             params: z.object({

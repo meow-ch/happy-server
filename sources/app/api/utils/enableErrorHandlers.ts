@@ -45,7 +45,12 @@ export function enableErrorHandlers(app: Fastify) {
 
     // Catch-all route for debugging 404s
     app.setNotFoundHandler((request, reply) => {
-        log({ module: '404-handler' }, `404 - Method: ${request.method}, Path: ${request.url}, Headers: ${JSON.stringify(request.headers)}`);
+        log({
+            module: '404-handler',
+            method: request.method,
+            path: request.url,
+            hasAuthorization: typeof request.headers.authorization === 'string'
+        }, 'Route not found');
         reply.code(404).send({ error: 'Not found', path: request.url, method: request.method });
     });
 
