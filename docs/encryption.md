@@ -1,6 +1,10 @@
 # Encryption and Data Encoding
 
-This document details how client data is encrypted, how encrypted blobs are structured, and how those blobs map onto protocol fields. It is based on `packages/happy-cli/src/api/encryption.ts` and the server routes that accept/emit these values.
+This document details how client data is encrypted, how encrypted blobs are
+structured, and how those blobs map onto protocol fields. The authoritative
+client implementation is in the sibling `happy-cli` repository, not under this
+repository: from the `happy-server` root, see
+`../happy-cli/src/api/encryption.ts` and `../happy-cli/src/api/types.ts`.
 
 For transport and event shapes, see `protocol.md`. For HTTP endpoints, see `api.md`.
 
@@ -346,7 +350,10 @@ POST /v1/kv
 ```
 
 ## Client-side types (shapes used before encryption)
-These are the client-side structures that get encrypted and sent over the wire. They are defined in `packages/happy-cli/src/api/types.ts`.
+These are representative JSON renderings of client-side structures encrypted
+before transport. Optional fields are omitted in some examples. The exact
+current schemas and TypeScript types are authoritative in the sibling
+[`happy-cli/src/api/types.ts`](../../happy-cli/src/api/types.ts).
 
 ### Session message content (encrypted)
 The payload stored in `SessionMessage.content` is always encrypted and wrapped as:
@@ -371,7 +378,7 @@ Messages are encrypted as `MessageContent` and then base64 encoded:
 ```json
 {
   "role": "agent",
-  "content": { "type": "output | codex | acp | event", "data": "..." },
+  "content": { "type": "output", "data": "..." },
   "meta": { }
 }
 ```
@@ -409,23 +416,40 @@ Messages are encrypted as `MessageContent` and then base64 encoded:
 {
   "controlledByUser": true,
   "requests": {
-    "<id>": { "tool": "...", "arguments": {}, "createdAt": 123 }
+    "<id>": {
+      "kind": "permission | questionnaire | plan_decision",
+      "tool": "...",
+      "arguments": {},
+      "createdAt": 123,
+      "questionnaire": {},
+      "planDecision": {}
+    }
   },
   "completedRequests": {
     "<id>": {
+      "kind": "permission | questionnaire | plan_decision",
       "tool": "...",
       "arguments": {},
       "createdAt": 123,
       "completedAt": 123,
-      "status": "canceled | denied | approved",
+      "status": "canceled | denied | approved | answered | expired | stayed_in_plan",
       "reason": "...",
-      "mode": "default | acceptEdits | bypassPermissions | plan | read-only | safe-yolo | yolo",
+      "mode": "default | acceptEdits | auto | bypassPermissions | dontAsk | plan | read-only | safe-yolo | yolo",
       "decision": "approved | approved_for_session | denied | abort",
-      "allowTools": ["..."]
+      "allowTools": ["..."],
+      "answers": {
+        "<question-id>": { "answers": ["..."] }
+      },
+      "planDecisionResult": "approve | stay_in_plan",
+      "feedback": "..."
     }
   }
 }
 ```
+
+`kind`, `questionnaire`, `planDecision`, and the completion-only fields are
+optional. The compact objects above illustrate their location; their nested
+questionnaire and plan-decision shapes are defined by the linked source.
 
 ### Machine metadata (encrypted)
 ```json
@@ -543,7 +567,12 @@ graph TB
 - Non-encrypted identifiers (ids, tags, versions) are always plain strings/numbers.
 
 ## Implementation references
-- Client crypto: `packages/happy-cli/src/api/encryption.ts`
-- Session message format: `packages/happy-cli/src/api/types.ts`
-- Server message ingestion: `packages/happy-server/sources/app/api/socket/sessionUpdateHandler.ts`
-- Artifact/KV routes: `packages/happy-server/sources/app/api/routes/artifactsRoutes.ts`, `packages/happy-server/sources/app/kv/kvMutate.ts`
+- Client crypto:
+  [`happy-cli/src/api/encryption.ts`](../../happy-cli/src/api/encryption.ts)
+- Session message and agent-state types:
+  [`happy-cli/src/api/types.ts`](../../happy-cli/src/api/types.ts)
+- Server message ingestion:
+  [`sources/app/api/socket/sessionUpdateHandler.ts`](../sources/app/api/socket/sessionUpdateHandler.ts)
+- Artifact and KV routes:
+  [`sources/app/api/routes/artifactsRoutes.ts`](../sources/app/api/routes/artifactsRoutes.ts)
+  and [`sources/app/kv/kvMutate.ts`](../sources/app/kv/kvMutate.ts)

@@ -1,6 +1,8 @@
 # Backend Architecture
 
-This document describes the Happy backend structure as implemented in `packages/happy-server`. It focuses on how the server is wired, how data flows through the system, and which subsystems handle which responsibilities.
+This document describes the Happy backend structure implemented in this
+repository. It focuses on how the server is wired, how data flows through the
+system, and which subsystems handle which responsibilities.
 
 ## System overview
 
@@ -41,13 +43,14 @@ graph TB
 ## At a glance
 - Runtime: Node.js + Fastify for HTTP, Socket.IO for realtime.
 - Database: Postgres via Prisma.
-- Cache/bus: Redis client is initialized (currently only pinged).
+- Realtime bus: Redis carries Socket.IO fanout, committed-message wakeups, and
+  TTL-bound RPC registrations. It is not canonical message storage.
 - Blob storage: S3-compatible (MinIO) for uploaded assets.
 - Crypto: privacy-kit for auth tokens and encrypted service tokens.
 - Metrics: Prometheus-style `/metrics` server + per-request HTTP metrics.
 
 ## Process lifecycle
-Entry point: `packages/happy-server/sources/main.ts`.
+Entry point: `sources/main.ts`.
 
 ```mermaid
 flowchart TD
@@ -66,14 +69,16 @@ flowchart TD
     Encrypt & GitHub & S3 & Auth --> Servers[Start Servers]
 
     subgraph Server Startup
-        Servers --> API[API Server]
+        Servers --> Realtime[Socket.IO adapters + notification outbox]
+        Realtime --> API[API Server]
         Servers --> Metrics[Metrics Server]
         Servers --> DBMetrics[DB Metrics Updater]
         Servers --> Presence[Presence Timeout Loop]
     end
 
     API & Metrics & DBMetrics & Presence --> Running([Running])
-    Running --> |SIGTERM| Shutdown[Shutdown Hooks]
+    Running --> |SIGTERM| Shutdown[Concurrent Shutdown Hooks]
+    Shutdown --> SocketStop[Close sockets, RPC registrations, outbox, Redis]
     Shutdown --> DBDisconnect[DB Disconnect]
     Shutdown --> FlushCache[Flush Activity Cache]
 ```
@@ -86,10 +91,21 @@ Startup sequence:
    - `initGithub()` configures GitHub App/webhooks if env vars exist.
    - `loadFiles()` verifies S3 bucket access.
    - `auth.init()` prepares token generator/verifier.
-4. Start API server (`startApi()`), metrics server, database metrics updater, and presence timeout loop.
-5. Remain alive until shutdown signal.
+4. Start Socket.IO Redis adapters, the durable message notification subscriber
+   and dispatcher, then begin accepting HTTP/Socket.IO traffic.
+5. Start the metrics server, database metrics updater, and presence timeout loop.
+6. Remain alive until shutdown signal.
 
-Shutdown hooks are registered for DB disconnect and activity-cache flush.
+On SIGTERM, the shutdown controller aborts and invokes the registered API,
+socket, storage, Redis, and `keepAlive` handlers concurrently. There is no
+global application timeout or guaranteed phase ordering. In particular, the
+presence timeout loop does not currently stop at the aborted delay and can
+re-enter database work until another shutdown handler disconnects Prisma.
+Docker's 45-second grace period is therefore the outer bound; it may end with a
+forced process stop rather than a completed graceful drain. The production
+image executes the app as PID 1 so SIGTERM reaches these hooks. See
+[`known-limitations.md`](known-limitations.md) before changing shutdown or
+deployment behavior.
 
 ## API layer
 `startApi()` in `sources/app/api/api.ts` wires the HTTP server:
@@ -116,7 +132,7 @@ graph LR
             R7[accountRoutes]
             R8[userRoutes / feedRoutes]
             R9[pushRoutes]
-            R10[connectRoutes / voiceRoutes]
+            R10[connectRoutes]
         end
     end
 
@@ -136,7 +152,7 @@ HTTP routes are organized by domain:
 - Account + usage (`accountRoutes`)
 - Social + feed (`userRoutes`, `feedRoutes`)
 - Push tokens (`pushRoutes`)
-- Integrations (`connectRoutes`, `voiceRoutes`)
+- Integrations (`connectRoutes`)
 - Version checks (`versionRoutes`)
 - Dev-only logging (`devRoutes`)
 
@@ -175,32 +191,22 @@ GitHub OAuth uses short-lived "ephemeral" tokens to protect the callback and is 
 ## Realtime sync architecture
 
 ```mermaid
-graph TB
-    subgraph Connections
-        U1[User Client 1]
-        U2[User Client 2]
-        S1[Session Client]
-        M1[Machine Daemon]
-    end
-
-    subgraph "Socket.IO Server"
-        Router[Event Router]
-
-        subgraph Scopes
-            US[user-scoped]
-            SS[session-scoped]
-            MS[machine-scoped]
-        end
-    end
-
-    U1 & U2 --> US
-    S1 --> SS
-    M1 --> MS
-
-    US & SS & MS --> Router
-
-    Router --> |persistent update| DB[(Postgres)]
-    Router --> |ephemeral event| Clients((Filtered Recipients))
+flowchart LR
+    Clients[User, runtime, and machine sockets] --> Socket[Socket.IO handlers]
+    Socket --> Ordinary[Ordinary transactional updates]
+    Socket --> Message[Session-message transaction]
+    Ordinary --> PG[(Postgres)]
+    Ordinary --> Router[Event Router]
+    Message --> Atomic[Message + notification outbox]
+    Atomic --> PG
+    PG --> Dispatcher[Outbox dispatcher]
+    Dispatcher --> Wakeup[Redis notification wakeup]
+    Wakeup --> Local[Lease-targeted local delivery]
+    Router --> Adapter[Socket.IO Redis adapter]
+    Local --> Clients
+    Adapter --> Clients
+    Clients --> Cursor[HTTP message cursor]
+    Cursor --> PG
 ```
 
 ### Connection types
@@ -210,11 +216,20 @@ Socket.IO connections are tagged by scope:
 - `machine-scoped`: daemon connections for machine state.
 
 ### Event router
-`EventRouter` (`sources/app/events/eventRouter.ts`) maintains per-user connection sets and routes:
-- **Persistent `update` events**: database-backed changes with a user-level monotonic `seq`.
-- **Ephemeral events**: presence/usage signals that are not persisted.
+`EventRouter` (`sources/app/events/eventRouter.ts`) maintains local connection
+metadata and Socket.IO rooms, and routes:
 
-The router implements recipient filters so updates go only to interested connections (e.g., all session listeners or a specific machine).
+- **Ordinary persistent `update` events**: database-backed changes with a
+  user-level monotonic `seq`, emitted after their transaction commits.
+- **Durable session-message notifications**: delivered only after the
+  PostgreSQL outbox commits. Every server consumes the lossy Redis wakeup but
+  emits only to its local user observers and the exact runtime lease captured
+  by the outbox row.
+- **Ephemeral events**: presence/usage signals that are not persisted as update
+  history.
+
+Live notifications may duplicate or be lost. Clients deduplicate and repair
+gaps with the ascending HTTP message cursor; PostgreSQL is authoritative.
 
 ### Update sequence numbers
 - `Account.seq` is the per-user update counter. It is incremented by `allocateUserSeq` and used as `UpdatePayload.seq`.
@@ -224,35 +239,30 @@ The router implements recipient filters so updates go only to interested connect
 
 ```mermaid
 flowchart LR
-    subgraph "High Frequency"
-        Events[session-alive / machine-alive]
-        Cache[Activity Cache]
-    end
-
-    subgraph "Batched Writes"
-        Batch[Batch Processor]
-        DB[(Postgres)]
-    end
-
-    subgraph "Timeout Loop"
-        Timer[10 min timer]
-        Offline[Mark Inactive]
-        Emit[Emit offline update]
-    end
-
-    Events --> |debounce| Cache
-    Cache --> |batch| Batch --> DB
-    Timer --> Cache
-    Cache --> |stale entries| Offline --> DB
-    Offline --> Emit
+    SessionAlive[protocol-v1 session-alive] --> LeaseCAS[Exact lease renewal]
+    LeaseCAS --> DB[(Postgres)]
+    LeaseCAS --> Activity[Coalesced activity fanout]
+    MachineAlive[machine-alive] --> MachineCache[Machine activity cache]
+    MachineCache --> Activity
+    Timer[Timeout loop] --> Offline[Mark stale rows inactive]
+    Offline --> DB
+    Offline --> Activity
 ```
 
 Presence is handled in `sources/app/presence`:
-- `session-alive` and `machine-alive` events are debounced in memory (ActivityCache).
-- Database writes are batched to reduce write load.
-- A timeout loop marks sessions/machines inactive after 10 minutes of silence and emits an offline ephemeral update.
 
-This splits high-frequency presence from durable storage updates.
+- Protocol-v1 `session-alive` renews the exact process-incarnation/socket-lease
+  tuple directly with PostgreSQL time. A stale socket observes its failed CAS
+  and is disconnected.
+- Session activity fanout is coalesced after the durable renewal. Untouched
+  legacy sessions have a narrow compatibility path and cannot update a
+  lease-managed row.
+- Machine activity remains coalesced for efficient presence fanout.
+- A timeout loop marks stale sessions/machines inactive and emits an offline
+  ephemeral update.
+
+Runtime readiness uses a four-minute persisted lease, not the ten-minute
+display-presence timeout.
 
 ## Storage and persistence
 ### Database (Prisma)
@@ -269,6 +279,8 @@ erDiagram
     Account ||--o{ UserFeedItem : receives
 
     Session ||--o{ SessionMessage : contains
+    Session ||--o{ SessionMessageNotificationOutbox : queues
+    Session ||--o{ SessionRuntimeInstanceRetirement : retires
     Session ||--o{ AccessKey : grants
 
     Machine ||--o{ AccessKey : receives
@@ -297,7 +309,15 @@ erDiagram
 ```
 
 - `Account`: public key identity, profile, settings, seq counters.
-- `Session` + `SessionMessage`: encrypted session metadata and message blobs.
+- `Session` + `SessionMessage`: encrypted session metadata and message blobs,
+  plus the current runtime process/socket lease.
+- `SessionMessageNotificationOutbox`: transactionally commits each message's
+  live-notification intent, exact target runtime lease, retry state, and
+  delivery marker. Delivery is FIFO per session; delivered rows are retained
+  for 24 hours, while cursor replay is the long-term recovery path.
+- `SessionRuntimeInstanceRetirement`: durable, non-reusable
+  process-incarnation tombstones with `replaying`, `ended`, or `superseded`
+  status.
 - `Machine`: encrypted machine metadata + daemon state.
 - `Artifact`: encrypted header/body + per-artifact key.
 - `AccessKey`: encrypted per-session-per-machine access keys.
@@ -325,9 +345,12 @@ flowchart TD
 `inTx()` wraps Prisma transactions with:
 - Serializable isolation.
 - Automatic retry on `P2034` (serialization failures).
-- `afterTx()` to emit socket updates after commit.
+- `afterTx()` to emit ordinary socket updates after commit.
 
-This pattern is used for multi-write operations like batch KV mutation and session deletion.
+This pattern is used for multi-write operations like batch KV mutation and
+session deletion. Session messages use the stronger transactional outbox: the
+message and notification row commit atomically instead of depending on an
+in-memory after-commit callback.
 
 ### Blob storage (S3/MinIO)
 The server uses S3-compatible storage for user assets (e.g., avatars):
@@ -336,7 +359,22 @@ The server uses S3-compatible storage for user assets (e.g., avatars):
 - Public URLs are derived from `S3_PUBLIC_URL`.
 
 ### Redis
-A Redis client is initialized in `main.ts` and pinged at startup. It can be expanded for caching or pub/sub if needed.
+
+Redis is required at startup and currently has three realtime roles:
+
+- the official Socket.IO adapter provides transient cross-process room fanout;
+- a dedicated Pub/Sub channel wakes local delivery of committed message-outbox
+  rows; and
+- TTL-bound RPC registry entries map a method to one socket generation.
+
+Redis Pub/Sub is intentionally lossy and RPC registration clients disable
+offline queuing and automatic command resend. PostgreSQL owns message history,
+outbox retry state, runtime leases, and retirement history.
+
+Runtime-owned RPC is dispatched only to an exact local socket while a
+PostgreSQL owner lock is held. Production therefore supports one Happy server
+replica until a receiver-side relay can reacquire the same fence before local
+dispatch.
 
 ## Data confidentiality model
 
@@ -378,10 +416,14 @@ graph TB
 - The server only encrypts/decrypts **service tokens** (GitHub OAuth tokens, vendor tokens) using the KeyTree derived from `HANDY_MASTER_SECRET`.
 
 ## Integrations
-- **GitHub**: OAuth connect + webhook verification, optional if env vars are set.
+- **GitHub**: OAuth connect + webhook verification exists in source, but the
+  Boujot Compose deployment does not currently propagate its environment
+  variables and callback completion redirects to the upstream Happy web app.
+  Treat it as unavailable in this fork's production deployment.
 - **AI vendors**: encrypted token storage for `openai`, `anthropic`, `gemini`.
-- **Voice**: RevenueCat subscription check + ElevenLabs token minting.
-- **Push tokens**: stored for later notification delivery.
+- **Push tokens**: CRUD registry only. Boujot/Happy CLI owns best-effort Expo
+  delivery; the server does not run a durable push-delivery worker. See
+  [Known limitations](known-limitations.md#push-delivery-is-client-owned-and-not-durable).
 
 ## Observability
 - `/health` route checks DB connectivity.
@@ -390,10 +432,12 @@ graph TB
 - WebSocket event counters and connection gauges are in `metrics2.ts`.
 
 ## Key implementation references
-- Entrypoint: `packages/happy-server/sources/main.ts`
-- API server: `packages/happy-server/sources/app/api/api.ts`
-- Socket server: `packages/happy-server/sources/app/api/socket.ts`
-- Event routing: `packages/happy-server/sources/app/events/eventRouter.ts`
-- Presence: `packages/happy-server/sources/app/presence`
-- Storage: `packages/happy-server/sources/storage`
-- Prisma schema: `packages/happy-server/prisma/schema.prisma`
+- Entrypoint: `sources/main.ts`
+- API server: `sources/app/api/api.ts`
+- Socket server: `sources/app/api/socket.ts`
+- Event routing: `sources/app/events/eventRouter.ts`
+- Runtime leases: `sources/app/presence/runtimeConnectionLease.ts`
+- Message outbox: `sources/app/session/sessionMessageNotificationOutbox.ts`
+- Presence: `sources/app/presence`
+- Storage: `sources/storage`
+- Prisma schema: `prisma/schema.prisma`

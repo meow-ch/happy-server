@@ -1,11 +1,11 @@
-# Handy Server - Development Guidelines
+# Happy Server - Development Guidelines
 
 This document contains the development guidelines and instructions for the Happy Server project. This guide OVERRIDES any default behaviors and MUST be followed exactly.
 
 ## Project Overview
 
 **Name**: happy-server  
-**Repository**: https://github.com/slopus/happy-server.git  
+**Repository**: https://github.com/meow-ch/happy-server.git
 **License**: MIT  
 **Language**: TypeScript  
 **Runtime**: Node.js 20  
@@ -20,7 +20,7 @@ This document contains the development guidelines and instructions for the Happy
 - **Validation**: Zod
 - **HTTP Client**: Axios
 - **Real-time**: Socket.io
-- **Cache/Pub-Sub**: Redis (via ioredis)
+- **Realtime coordination**: Redis Pub/Sub and TTL-bound RPC registrations
 - **Testing**: Vitest
 - **Package Manager**: Yarn (not npm)
 
@@ -38,7 +38,7 @@ This document contains the development guidelines and instructions for the Happy
 - FFmpeg installed (for media processing)
 - Python3 installed
 - PostgreSQL database
-- Redis (for event bus and caching)
+- Redis (for Socket.IO fanout, message wakeups, and RPC registration)
 
 ## Code Style and Structure
 
@@ -57,24 +57,15 @@ This document contains the development guidelines and instructions for the Happy
 ### Folder Structure
 ```
 /sources                    # Root of the sources
-├── /app                   # Application entry points
-│   ├── api.ts            # API server setup
-│   └── timeout.ts        # Timeout handling
-├── /apps                  # Applications directory
-│   └── /api              # API server application
-│       └── /routes       # API routes
-├── /modules              # Reusable modules (non-application logic)
-├── /utils                # Low level or abstract utilities
-├── /recipes              # Scripts to run outside of the server
-├── /services             # Core services
-│   └── pubsub.ts        # Pub/sub service
-├── /storage              # Database and storage utilities
-│   ├── db.ts            # Database client
-│   ├── inTx.ts          # Transaction wrapper
-│   ├── repeatKey.ts     # Key utilities
-│   ├── simpleCache.ts   # Caching utility
-│   └── types.ts         # Storage types
-└── main.ts               # Main entry point
+├── /app
+│   ├── /api              # Fastify, Socket.IO, routes, and handlers
+│   ├── /events           # Recipient routing and realtime fanout
+│   ├── /presence         # Runtime leases and activity
+│   └── /session          # Durable message/outbox handling
+├── /modules              # Reusable modules
+├── /storage              # Prisma, Redis, S3, and transaction helpers
+├── /utils                # Low-level utilities
+└── main.ts               # Process entrypoint
 ```
 
 ### Naming Conventions
@@ -101,6 +92,9 @@ This document contains the development guidelines and instructions for the Happy
 3. Always write tests for utility functions BEFORE writing the code
 4. Iterate implementation and tests until the function works as expected
 5. Always write documentation for utility functions
+6. A timer that accepts an `AbortSignal` must remove its abort listener on both
+   timer completion and abort, and clear the timer on abort. Test listener and
+   timer cleanup so shared shutdown signals cannot accumulate handlers.
 
 ## Modules
 
@@ -117,10 +111,8 @@ This document contains the development guidelines and instructions for the Happy
 - When implementing related groups of functions (math, date, etc.)
 
 ### Known Modules
-- **ai**: AI wrappers to interact with AI services
-- **eventbus**: Event bus to send and receive events between modules and applications
-- **lock**: Simple lock to synchronize access to resources in the whole cluster
-- **media**: Tools to work with media files
+- **encrypt**: KeyTree-backed encryption for server-managed service tokens.
+- **github**: GitHub App, OAuth, and webhook integration.
 
 ## Applications
 
@@ -133,20 +125,26 @@ This document contains the development guidelines and instructions for the Happy
 ### Prisma Usage
 - Prisma is used as ORM
 - Use "inTx" to wrap database operations in transactions
-- Do not update schema without absolute necessity
 - For complex fields, use "Json" type
-- NEVER DO MIGRATION YOURSELF. Only run yarn generate when new types needed
-
-### Current Schema Status
-The project has pending Prisma migrations that need to be applied:
-- Migration: `20250715012822_add_metadata_version_agent_state`
+- Schema changes require a reviewed Prisma migration and a regenerated client.
+- Production applies migrations with `prisma migrate deploy`, after every old
+  server writer has stopped and before the new server starts accepting traffic.
+- Never run lease-aware and lease-unaware writers against the database at the
+  same time. After protocol-v1 runtime state has been written, recover by
+  rolling forward to a compatible build rather than restarting an old binary.
 
 ## Events
 
 ### Event Bus
-- eventbus allows sending and receiving events inside the process and between different processes
-- eventbus is local or redis based
-- Use "afterTx" to send events after transaction is committed successfully instead of directly emitting events
+- Socket.IO uses Redis Pub/Sub for transient cross-process fanout.
+- Session messages commit their PostgreSQL message and notification-outbox row
+  atomically. Redis is only a low-latency wakeup; cursor replay from PostgreSQL
+  is the recovery path.
+- RPC registrations are short-lived Redis entries. Runtime-owned RPC delivery
+  is fenced by the exact PostgreSQL runtime lease and is local to one server.
+- Use `afterTx` for ordinary updates that should emit only after a successful
+  transaction. Do not use an after-commit callback in place of the durable
+  session-message outbox.
 
 ## Testing
 
@@ -156,19 +154,32 @@ The project has pending Prisma migrations that need to be applied:
 
 ## API Development
 
-- API server is in `/sources/apps/api`
-- Routes are in `/sources/apps/api/routes`
+- API server is in `/sources/app/api`
+- Routes are in `/sources/app/api/routes`
 - Use Fastify with Zod for type-safe route definitions
 - Always validate inputs using Zod
-- **Idempotency**: Design all operations to be idempotent - clients may retry requests automatically and the backend must handle multiple invocations of the same operation gracefully, producing the same result as a single invocation
+- **Idempotency**: make retryable mutations explicitly idempotent with a stable
+  key. Do not assume every operation is idempotent.
+- **RPC retry safety**: retry an RPC only when the acknowledgement is exactly
+  `{ ok: false, outcome: "not_started", retryable: true }`, the returned
+  `callId` matches, and the retry preserves the same `callId`, method, and
+  serialized payload. Never automatically retry `outcome: "unknown"`, a
+  timeout/disconnect, a missing or malformed acknowledgement, registry
+  unavailability, or a plain `ok: false` response.
 
 ## Docker Deployment
 
 The project includes a multi-stage Dockerfile:
-1. Builder stage: Installs dependencies and builds the application
-2. Runner stage: Minimal runtime with only necessary files
-3. Exposes port 3000
-4. Requires FFmpeg and Python3 in the runtime
+1. Dependency stage: installs dependencies and generates Prisma types.
+2. Runner stage: contains the application and required FFmpeg/Python tooling.
+3. Runs `prisma migrate deploy` before the API process.
+4. Executes the Node/tsx process as PID 1 so SIGTERM reaches shutdown handlers.
+5. The application listens on port 3005 by default.
+
+Production runtime-owned RPC currently supports exactly one Happy server
+replica. Deploy with Recreate semantics: stop and drain the old writer, migrate
+with no server traffic, then start the new writer. Automatic rollback to a
+lease-unaware image is unsafe; use manual readiness checks and roll forward.
 
 ## Important Reminders
 
@@ -196,7 +207,10 @@ The project includes a multi-stage Dockerfile:
 #### Auth Flow Debugging
 - CLI must hit `/v1/auth/request` to create auth request
 - Mobile scans QR and hits `/v1/auth/response` to approve
-- **Tell**: 404 on `/v1/auth/response` = server likely restarted/crashed
+- **Tell**: 404 on `/v1/auth/response` = the supplied public key has no
+  matching `TerminalAuthRequest` row (the request is missing, the keys differ,
+  or the clients reached different databases). A server restart alone does not
+  remove the persisted row.
 - **Tell**: "Auth failed - user not found" = token issue or user doesn't exist
 
 #### Session Creation Flow
@@ -272,7 +286,8 @@ tail -500 .logs/*.log | grep "applySessions.*active" | tail -10
 - **Mobile logs**: Sent with `timestamp` in UTC, converted to `localTime` on server
 - **All consolidated logs**: Have `localTime` field for easy correlation
 - When writing a some operations on db, like adding friend, sending a notification - always create a dedicated file in relevant subfolder of the @sources/app/ folder. Good example is "friendAdd", always prefix with an entity type, then action that should be performed.
-- Never create migrations yourself, it is can be done only by human
+- Do not create or apply a production migration without explicit human
+  authorization and review. `yarn migrate` is a local-development command.
 - Do not return stuff from action functions "just in case", only essential
 - Do not add logging when not asked
 - do not run non-transactional things (like uploadign files) in transactions

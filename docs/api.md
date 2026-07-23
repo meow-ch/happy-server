@@ -9,6 +9,12 @@ This document covers the HTTP API surface and authentication flows. For WebSocke
 
 We intentionally avoid the full REST verb palette because many operations span multiple entities or have non-CRUD semantics.
 
+One legacy exception is the access-key `PUT` route listed below. The HTTP CORS
+allowlist currently contains only `GET`, `POST`, and `DELETE`, so a
+cross-origin browser preflight for that `PUT` route fails. Same-origin and
+non-browser callers can use it; browser clients must not assume cross-origin
+support until `PUT` is added to the server allowlist.
+
 ## Authentication
 Most endpoints require `Authorization: Bearer <token>`.
 
@@ -43,9 +49,40 @@ Auth flows:
 - `GET /v2/sessions/active?limit=...`
 - `GET /v2/sessions?cursor=cursor_v1_<id>&limit=...&changedSince=...`
 - `POST /v1/sessions` (create or load by `tag`)
+- `GET /v1/sessions/:sessionId` (authoritative protocol-v1 runtime connection
+  snapshot; includes inactive and old sessions owned by the authenticated
+  account)
 - `GET /v1/sessions/:sessionId/messages` (legacy latest 150)
 - `GET /v1/sessions/:sessionId/messages?afterSeq=...&limit=...` (canonical ascending cursor replay, up to 500 per page; use on startup, reconnect, and sequence gaps because Redis fanout is best-effort)
 - `DELETE /v1/sessions/:sessionId`
+
+The single-session response is:
+
+```json
+{
+  "session": {
+    "id": "<session id>",
+    "agentStateVersion": 1,
+    "runtimeConnectionProtocolVersion": 1,
+    "runtimeConnected": true,
+    "runtimeInstanceId": "<runtime process UUID or null>",
+    "runtimeLeaseInstanceId": "<leased runtime process UUID or null>",
+    "runtimeLeaseExpiresAt": 1784790000000,
+    "runtimeInstanceRetired": false,
+    "runtimeConnectionCheckedAt": 1784789900000,
+    "dataEncryptionKey": "<base64 or null>"
+  }
+}
+```
+
+`runtimeConnectionCheckedAt` and `runtimeLeaseExpiresAt` are Unix milliseconds
+from one PostgreSQL-clock snapshot. For a protocol-v1 managed runtime,
+`runtimeConnected` is true only when the session is active, the active process
+and lease instance match, the lease has not expired at the checked time, and
+the process incarnation is not retired. A bounded compatibility heuristic is
+used only for untouched legacy rows; once a lease marker exists, the row never
+falls back to that heuristic. The response is `private, no-store`; an unknown
+or other account's session returns `404` with `SESSION_NOT_FOUND`.
 
 Cursor replay returns `{ messages, hasMore, nextAfterSeq }`. Continue until
 `hasMore` is false and retain `nextAfterSeq`; live notifications are
@@ -103,13 +140,12 @@ best-effort, potentially duplicate hints, while this endpoint is the authoritati
 - `GET /v1/friends`
 - `GET /v1/feed`
 
-### Version and voice
+### Version
 - `POST /v1/version`
-- `POST /v1/voice/token`
 
 ### Dev-only
 - `POST /logs-combined-from-cli-and-mobile-for-simple-ai-debugging` (only if enabled)
 
 ## Implementation references
-- API routes: `packages/happy-server/sources/app/api/routes`
-- Auth module: `packages/happy-server/sources/app/auth/auth.ts`
+- API routes: `sources/app/api/routes`
+- Auth module: `sources/app/auth/auth.ts`

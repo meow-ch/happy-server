@@ -1,3 +1,6 @@
+# LEGACY UPSTREAM EXAMPLE — NOT A BOUJOT PRODUCTION MANIFEST.
+# Registry, names, domains, and secret paths below are intentionally retained
+# for historical reference and must be reviewed/replaced before any use.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
