@@ -1,5 +1,3 @@
-import { warn } from "./log";
-
 export async function delay(ms: number, signal?: AbortSignal): Promise<void> {
     if (!signal) {
         return new Promise(resolve => setTimeout(resolve, ms));
@@ -10,18 +8,26 @@ export async function delay(ms: number, signal?: AbortSignal): Promise<void> {
     }
     
     await new Promise<void>((resolve) => {
-        const timeout = setTimeout(resolve, ms);
-        
-        const abortHandler = () => {
+        let settled = false;
+        let timeout: ReturnType<typeof setTimeout>;
+
+        const finish = () => {
+            if (settled) {
+                return;
+            }
+            settled = true;
             clearTimeout(timeout);
+            signal.removeEventListener('abort', abortHandler);
             resolve();
         };
-        
+
+        const abortHandler = () => finish();
+        timeout = setTimeout(finish, ms);
+        signal.addEventListener('abort', abortHandler, { once: true });
+
+        // Close the race between the initial aborted check and listener setup.
         if (signal.aborted) {
-            clearTimeout(timeout);
-            resolve();
-        } else {
-            signal.addEventListener('abort', abortHandler, { once: true });
+            finish();
         }
     });
 }
