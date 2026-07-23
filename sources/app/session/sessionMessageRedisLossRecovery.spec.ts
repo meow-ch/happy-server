@@ -19,6 +19,8 @@ describe("session message Redis-loss recovery contract", () => {
         await bus.publish({
             userId: "account-1",
             originSocketId: null,
+            targetRuntimeConnectionLeaseId: "lease-1",
+            targetLegacyRuntimeConnection: false,
             payload: {
                 id: "notification-8",
                 seq: 40,

@@ -9,17 +9,25 @@ export function startTimeout() {
     forever('session-timeout', async () => {
         while (true) {
             // Find timed out sessions
+            const sessionCutoff = new Date(Date.now() - 1000 * 60 * 10);
             const sessions = await db.session.findMany({
                 where: {
                     active: true,
                     lastActiveAt: {
-                        lte: new Date(Date.now() - 1000 * 60 * 10) // 10 minutes
+                        lte: sessionCutoff // 10 minutes
                     }
                 }
             });
             for (const session of sessions) {
                 const updated = await db.session.updateManyAndReturn({
-                    where: { id: session.id, active: true },
+                    // Repeat the observed cutoff in the write CAS. A heartbeat
+                    // or takeover that refreshed the row after findMany must
+                    // not be marked inactive by this stale timeout iteration.
+                    where: {
+                        id: session.id,
+                        active: true,
+                        lastActiveAt: { lte: sessionCutoff },
+                    },
                     data: { active: false }
                 });
                 if (updated.length === 0) {

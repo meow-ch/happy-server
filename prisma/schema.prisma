@@ -103,15 +103,29 @@ model Session {
     seq               Int              @default(0)
     active            Boolean          @default(true)
     activeInstanceId  String?
+    runtimeConnectionLeaseId         String?
+    runtimeConnectionLeaseInstanceId String?
+    runtimeConnectionLeaseExpiresAt  DateTime?
     lastActiveAt      DateTime         @default(now())
     createdAt         DateTime         @default(now())
     updatedAt         DateTime         @updatedAt
     messages          SessionMessage[]
     usageReports      UsageReport[]
     accessKeys        AccessKey[]
+    retiredRuntimeInstances SessionRuntimeInstanceRetirement[]
 
     @@unique([accountId, tag])
     @@index([accountId, updatedAt(sort: Desc)])
+}
+
+model SessionRuntimeInstanceRetirement {
+    sessionId  String
+    session    Session  @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+    instanceId String
+    status     String
+    retiredAt  DateTime @default(now())
+
+    @@id([sessionId, instanceId])
 }
 
 model SessionMessage {
@@ -140,6 +154,8 @@ model SessionMessageNotificationOutbox {
     message        SessionMessage @relation(fields: [messageId], references: [id], onDelete: Cascade)
     updateSeq      Int
     originSocketId String?
+    targetRuntimeConnectionLeaseId String?
+    targetLegacyRuntimeConnection  Boolean        @default(false)
     attempts       Int            @default(0)
     nextAttemptAt  DateTime       @default(now())
     claimedAt      DateTime?

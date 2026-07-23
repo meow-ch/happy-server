@@ -19,6 +19,27 @@ describe("Socket.IO event rooms", () => {
         ]);
     });
 
+    it("isolates runtime generations in lease rooms and gives replay transports no live room", () => {
+        expect(getConnectionRooms({
+            connectionType: "session-scoped",
+            userId: "account-1",
+            sessionId: "session-1",
+            sessionInstanceId: "instance-1",
+            runtimeConnectionLeaseId: "lease-new",
+        })).toEqual([
+            "account:account-1:all",
+            "account:account-1:session:session-1:runtime-lease:lease-new",
+        ]);
+        expect(getConnectionRooms({
+            connectionType: "session-scoped",
+            userId: "account-1",
+            sessionId: "session-1",
+            sessionInstanceId: "instance-1",
+            runtimeConnectionLeaseId: "lease-old",
+            replayOnly: true,
+        })).toEqual([]);
+    });
+
     it("routes session updates to user observers and the matching session across nodes", () => {
         expect(getRecipientRooms("account-1", {
             type: "all-interested-in-session",
@@ -54,12 +75,14 @@ describe("Socket.IO event rooms", () => {
         eventRouter.emitDurableSessionMessageLocal({
             userId: "account-1",
             originSocketId: "producer-socket",
+            targetRuntimeConnectionLeaseId: "lease-1",
+            targetLegacyRuntimeConnection: false,
             payload
         });
 
         expect(to).toHaveBeenCalledWith([
             "account:account-1:user",
-            "account:account-1:session:session-1"
+            "account:account-1:session:session-1:runtime-lease:lease-1"
         ]);
         expect(except).toHaveBeenCalledWith("producer-socket");
         expect(emit).toHaveBeenCalledWith("update", payload);

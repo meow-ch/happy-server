@@ -9,7 +9,8 @@ const mocks = vi.hoisted(() => ({
     sessionMessageFindMany: vi.fn(),
     allocateUserSeq: vi.fn(),
     emitUpdate: vi.fn(),
-    buildNewSessionUpdate: vi.fn()
+    buildNewSessionUpdate: vi.fn(),
+    findRuntimeConnectionSession: vi.fn(),
 }));
 
 vi.mock("@/storage/db", () => ({
@@ -31,6 +32,9 @@ vi.mock("@/app/events/eventRouter", () => ({
 
 vi.mock("@/storage/seq", () => ({ allocateUserSeq: mocks.allocateUserSeq }));
 vi.mock("@/app/session/sessionDelete", () => ({ sessionDelete: vi.fn() }));
+vi.mock("@/app/presence/runtimeConnectionLease", () => ({
+    findRuntimeConnectionSession: mocks.findRuntimeConnectionSession,
+}));
 
 import { sessionRoutes } from "./sessionRoutes";
 
@@ -214,6 +218,7 @@ describe("GET /v1/sessions/:sessionId", () => {
     beforeEach(() => {
         mocks.sessionFindFirst.mockReset();
         mocks.sessionMessageFindMany.mockReset();
+        mocks.findRuntimeConnectionSession.mockReset();
     });
 
     afterEach(async () => {
@@ -221,7 +226,18 @@ describe("GET /v1/sessions/:sessionId", () => {
     });
 
     it("returns an owned old inactive session including its encryption key", async () => {
-        mocks.sessionFindFirst.mockResolvedValue(oldInactiveSession());
+        mocks.findRuntimeConnectionSession.mockResolvedValue({
+            id: "session-old",
+            agentStateVersion: 5,
+            runtimeConnectionProtocolVersion: 1,
+            runtimeConnected: false,
+            runtimeInstanceId: null,
+            runtimeLeaseInstanceId: null,
+            runtimeLeaseExpiresAt: null,
+            runtimeInstanceRetired: false,
+            runtimeConnectionCheckedAt: new Date("2026-07-22T18:00:00.000Z"),
+            dataEncryptionKey: new Uint8Array([1, 2, 3, 4]),
+        });
         const app = await createApp("account-owner");
 
         const response = await app.inject({
@@ -236,27 +252,32 @@ describe("GET /v1/sessions/:sessionId", () => {
             session: {
                 id: "session-old",
                 agentStateVersion: 5,
+                runtimeConnectionProtocolVersion: 1,
                 runtimeConnected: false,
+                runtimeInstanceId: null,
+                runtimeLeaseInstanceId: null,
+                runtimeLeaseExpiresAt: null,
+                runtimeInstanceRetired: false,
+                runtimeConnectionCheckedAt: new Date("2026-07-22T18:00:00.000Z").getTime(),
                 dataEncryptionKey: Buffer.from([1, 2, 3, 4]).toString("base64")
             }
         });
-        expect(mocks.sessionFindFirst).toHaveBeenCalledWith(expect.objectContaining({
-            where: { id: "session-old", accountId: "account-owner" }
-        }));
-        expect(mocks.sessionFindFirst).toHaveBeenCalledWith(expect.objectContaining({
-            select: {
-                id: true,
-                agentStateVersion: true,
-                activeInstanceId: true,
-                dataEncryptionKey: true
-            }
-        }));
+        expect(mocks.findRuntimeConnectionSession)
+            .toHaveBeenCalledWith("account-owner", "session-old");
     });
 
     it("reports a claimed CLI session incarnation as runtime connected", async () => {
-        mocks.sessionFindFirst.mockResolvedValue({
-            ...oldInactiveSession(),
-            activeInstanceId: "8c46b5ad-4155-47ed-a470-d21c7be49baf"
+        mocks.findRuntimeConnectionSession.mockResolvedValue({
+            id: "session-old",
+            agentStateVersion: 5,
+            runtimeConnectionProtocolVersion: 1,
+            runtimeConnected: true,
+            runtimeInstanceId: "8c46b5ad-4155-47ed-a470-d21c7be49baf",
+            runtimeLeaseInstanceId: "8c46b5ad-4155-47ed-a470-d21c7be49baf",
+            runtimeLeaseExpiresAt: new Date("2026-07-22T18:02:00.000Z"),
+            runtimeInstanceRetired: false,
+            runtimeConnectionCheckedAt: new Date("2026-07-22T18:00:00.000Z"),
+            dataEncryptionKey: new Uint8Array([1, 2, 3, 4]),
         });
         const app = await createApp("account-owner");
 
@@ -270,9 +291,20 @@ describe("GET /v1/sessions/:sessionId", () => {
     });
 
     it("returns 404 for a session owned by another account", async () => {
-        mocks.sessionFindFirst.mockImplementation(async ({ where }: { where: { id: string; accountId: string } }) => {
-            return where.id === "session-old" && where.accountId === "account-owner"
-                ? oldInactiveSession()
+        mocks.findRuntimeConnectionSession.mockImplementation(async (accountId: string, sessionId: string) => {
+            return sessionId === "session-old" && accountId === "account-owner"
+                ? {
+                    id: "session-old",
+                    agentStateVersion: 5,
+                    runtimeConnectionProtocolVersion: 1,
+                    runtimeConnected: false,
+                    runtimeInstanceId: null,
+                    runtimeLeaseInstanceId: null,
+                    runtimeLeaseExpiresAt: null,
+                    runtimeInstanceRetired: false,
+                    runtimeConnectionCheckedAt: new Date("2026-07-22T18:00:00.000Z"),
+                    dataEncryptionKey: new Uint8Array([1, 2, 3, 4]),
+                }
                 : null;
         });
         const app = await createApp("account-attacker");
@@ -289,15 +321,25 @@ describe("GET /v1/sessions/:sessionId", () => {
             error: "Session not found",
             code: "SESSION_NOT_FOUND"
         });
-        expect(mocks.sessionFindFirst).toHaveBeenCalledWith(expect.objectContaining({
-            where: { id: "session-old", accountId: "account-attacker" }
-        }));
+        expect(mocks.findRuntimeConnectionSession)
+            .toHaveBeenCalledWith("account-attacker", "session-old");
     });
 
     it("does not silently serialize an omitted encryption-key field as null", async () => {
-        const session: Record<string, unknown> = { ...oldInactiveSession() };
+        const session: Record<string, unknown> = {
+            id: "session-old",
+            agentStateVersion: 5,
+            runtimeConnectionProtocolVersion: 1,
+            runtimeConnected: false,
+            runtimeInstanceId: null,
+            runtimeLeaseInstanceId: null,
+            runtimeLeaseExpiresAt: null,
+            runtimeInstanceRetired: false,
+            runtimeConnectionCheckedAt: new Date("2026-07-22T18:00:00.000Z"),
+            dataEncryptionKey: new Uint8Array([1, 2, 3, 4]),
+        };
         delete session.dataEncryptionKey;
-        mocks.sessionFindFirst.mockResolvedValue(session);
+        mocks.findRuntimeConnectionSession.mockResolvedValue(session);
         const app = await createApp("account-owner");
 
         const response = await app.inject({
@@ -309,7 +351,7 @@ describe("GET /v1/sessions/:sessionId", () => {
     });
 
     it("returns 404 for an unknown session", async () => {
-        mocks.sessionFindFirst.mockResolvedValue(null);
+        mocks.findRuntimeConnectionSession.mockResolvedValue(null);
         const app = await createApp("account-owner");
 
         const response = await app.inject({

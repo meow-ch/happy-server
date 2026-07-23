@@ -18,10 +18,21 @@ function createMessage(overrides: Record<string, unknown> = {}): SessionMessage 
 function createTx(options: {
     sessionExists?: boolean;
     existingMessage?: ReturnType<typeof createMessage> | null;
+    session?: Record<string, unknown>;
 } = {}) {
     const message = createMessage();
     return {
-        $queryRaw: vi.fn().mockResolvedValue(options.sessionExists === false ? [] : [{ id: "session-1" }]),
+        $queryRaw: vi.fn().mockResolvedValue(options.sessionExists === false ? [] : [{
+            id: "session-1",
+            activeInstanceId: null,
+            runtimeConnectionLeaseId: null,
+            runtimeConnectionLeaseInstanceId: null,
+            runtimeLeaseCurrent: false,
+            runtimeReplayLeaseCurrent: false,
+            runtimeInstanceRetirementStatus: null,
+            targetLegacyRuntimeConnection: false,
+            ...options.session,
+        }]),
         session: {
             update: vi.fn().mockResolvedValue({ seq: message.seq })
         },
@@ -79,7 +90,9 @@ describe("persistSessionMessageInTx", () => {
                 sessionId: "session-1",
                 messageId: "message-1",
                 updateSeq: 31,
-                originSocketId: "socket-1"
+                originSocketId: "socket-1",
+                targetRuntimeConnectionLeaseId: null,
+                targetLegacyRuntimeConnection: false,
             }
         });
         expect(tx.sessionMessage.create.mock.invocationCallOrder[0])
@@ -168,6 +181,202 @@ describe("persistSessionMessageInTx", () => {
         });
         expect(tx.sessionMessage.findUnique).not.toHaveBeenCalled();
         expect(tx.sessionMessageNotificationOutbox.create).not.toHaveBeenCalled();
+    });
+
+    it("atomically fences a live runtime write and snapshots its exact delivery lease", async () => {
+        const instanceId = "90b85ebd-6bb8-41bb-aa2d-681765e24f0d";
+        const tx = createTx({
+            session: {
+                activeInstanceId: instanceId,
+                runtimeConnectionLeaseId: "lease-1",
+                runtimeConnectionLeaseInstanceId: instanceId,
+                runtimeLeaseCurrent: true,
+                runtimeInstanceRetirementStatus: null,
+            },
+        });
+
+        const result = await persistSessionMessageInTx(tx as never, {
+            userId: "account-1",
+            sessionId: "session-1",
+            ciphertext: "ciphertext",
+            localId: "local-1",
+            runtimeAuthorization: {
+                type: "lease",
+                sessionInstanceId: instanceId,
+                leaseId: "lease-1",
+            },
+        });
+
+        expect(result.result).toBe("success");
+        expect(tx.sessionMessageNotificationOutbox.create).toHaveBeenCalledWith({
+            data: expect.objectContaining({
+                targetRuntimeConnectionLeaseId: "lease-1",
+                targetLegacyRuntimeConnection: false,
+            }),
+        });
+    });
+
+    it("marks a lost live lease retryable only while its incarnation remains current and unretired", async () => {
+        const instanceId = "90b85ebd-6bb8-41bb-aa2d-681765e24f0d";
+        const current = createTx({
+            session: {
+                activeInstanceId: instanceId,
+                runtimeConnectionLeaseId: "new-lease",
+                runtimeConnectionLeaseInstanceId: instanceId,
+                runtimeLeaseCurrent: true,
+                runtimeInstanceRetirementStatus: null,
+            },
+        });
+        await expect(persistSessionMessageInTx(current as never, {
+            userId: "account-1",
+            sessionId: "session-1",
+            ciphertext: "ciphertext",
+            localId: "local-1",
+            runtimeAuthorization: {
+                type: "lease",
+                sessionInstanceId: instanceId,
+                leaseId: "old-lease",
+            },
+        })).resolves.toEqual({
+            result: "error",
+            code: "runtime_connection_stale",
+            retryable: true,
+        });
+
+        const superseded = createTx({
+            session: {
+                activeInstanceId: "8c46b5ad-4155-47ed-a470-d21c7be49baf",
+                runtimeInstanceRetirementStatus: null,
+            },
+        });
+        await expect(persistSessionMessageInTx(superseded as never, {
+            userId: "account-1",
+            sessionId: "session-1",
+            ciphertext: "ciphertext",
+            localId: "local-1",
+            runtimeAuthorization: {
+                type: "lease",
+                sessionInstanceId: instanceId,
+                leaseId: "old-lease",
+            },
+        })).resolves.toEqual({
+            result: "error",
+            code: "runtime_connection_stale",
+            retryable: false,
+        });
+    });
+
+    it("allows exact replay leases, retries an expired replay lease, and terminally rejects displacement", async () => {
+        const instanceId = "90b85ebd-6bb8-41bb-aa2d-681765e24f0d";
+        const exact = createTx({
+            session: {
+                activeInstanceId: instanceId,
+                runtimeConnectionLeaseId: "replay-lease",
+                runtimeConnectionLeaseInstanceId: instanceId,
+                runtimeReplayLeaseCurrent: true,
+                runtimeInstanceRetirementStatus: "replaying",
+            },
+        });
+        await expect(persistSessionMessageInTx(exact as never, {
+            userId: "account-1",
+            sessionId: "session-1",
+            ciphertext: "ciphertext",
+            localId: "local-1",
+            runtimeAuthorization: {
+                type: "replay",
+                sessionInstanceId: instanceId,
+                leaseId: "replay-lease",
+            },
+        })).resolves.toMatchObject({ result: "success", duplicate: false });
+
+        const expired = createTx({
+            session: {
+                activeInstanceId: instanceId,
+                runtimeConnectionLeaseId: "expired-replay-lease",
+                runtimeConnectionLeaseInstanceId: instanceId,
+                runtimeReplayLeaseCurrent: false,
+                runtimeInstanceRetirementStatus: "replaying",
+            },
+        });
+        await expect(persistSessionMessageInTx(expired as never, {
+            userId: "account-1",
+            sessionId: "session-1",
+            ciphertext: "ciphertext",
+            localId: "local-1",
+            runtimeAuthorization: {
+                type: "replay",
+                sessionInstanceId: instanceId,
+                leaseId: "expired-replay-lease",
+            },
+        })).resolves.toEqual({
+            result: "error",
+            code: "runtime_connection_stale",
+            retryable: true,
+        });
+
+        const displaced = createTx({
+            session: {
+                activeInstanceId: "8c46b5ad-4155-47ed-a470-d21c7be49baf",
+                runtimeInstanceRetirementStatus: null,
+            },
+        });
+        await expect(persistSessionMessageInTx(displaced as never, {
+            userId: "account-1",
+            sessionId: "session-1",
+            ciphertext: "ciphertext",
+            localId: "local-1",
+            runtimeAuthorization: {
+                type: "replay",
+                sessionInstanceId: instanceId,
+                leaseId: "replay-lease",
+            },
+        })).resolves.toEqual({
+            result: "error",
+            code: "runtime_connection_stale",
+            retryable: false,
+        });
+    });
+
+    it("lets a terminal replay acknowledge only an exact already-committed local ID", async () => {
+        const instanceId = "90b85ebd-6bb8-41bb-aa2d-681765e24f0d";
+        const existingMessage = createMessage();
+        const duplicate = createTx({
+            existingMessage,
+            session: {
+                activeInstanceId: instanceId,
+                runtimeInstanceRetirementStatus: "ended",
+            },
+        });
+        await expect(persistSessionMessageInTx(duplicate as never, {
+            userId: "account-1",
+            sessionId: "session-1",
+            ciphertext: "ciphertext",
+            localId: "local-1",
+            runtimeAuthorization: { type: "replay", sessionInstanceId: instanceId },
+        })).resolves.toEqual({
+            result: "success",
+            duplicate: true,
+            message: existingMessage,
+            updateSeq: null,
+        });
+
+        const newOutput = createTx({
+            session: {
+                activeInstanceId: instanceId,
+                runtimeInstanceRetirementStatus: "ended",
+            },
+        });
+        await expect(persistSessionMessageInTx(newOutput as never, {
+            userId: "account-1",
+            sessionId: "session-1",
+            ciphertext: "new-ciphertext",
+            localId: "new-local-id",
+            runtimeAuthorization: { type: "replay", sessionInstanceId: instanceId },
+        })).resolves.toEqual({
+            result: "error",
+            code: "runtime_connection_stale",
+            retryable: false,
+        });
     });
 });
 

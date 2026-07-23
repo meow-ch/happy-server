@@ -206,7 +206,9 @@ Field names below match on-wire payloads.
 - `rpc-call`
   - `{ method, params, callId? }` -> callback `{ ok, result? | error?, callId? }`.
   - When present, `callId` is a UUID forwarded unchanged in `rpc-request` and echoed by the server.
-  - The server resolves one generation-fenced Redis registration and attempts exactly that socket. After an attempted delivery, a timeout/disconnect returns `{ ok: false, outcome: "unknown" }`; it never fails over because execution may already have happened.
+  - If ownership contention or a missing target is detected before dispatch, the server returns `{ ok: false, outcome: "not_started", retryable: true, error, callId? }`. A caller may retry only that known-not-started request, preserving the same `callId` and payload.
+  - After an attempted delivery, a timeout/disconnect returns `{ ok: false, outcome: "unknown", callId? }`; it never fails over, and callers must not blindly retry, because execution may already have happened.
+  - Runtime-owned RPC is dispatched directly to the exact local socket under the database owner lock. The supported deployment is one server replica; multi-replica runtime RPC requires a receiver-side relay that reacquires and validates the exact runtime owner before local dispatch. Nonlocal runtime targets fail as `not_started`.
   - RPC parameters are limited to 4 MiB after serialization.
 
 ## HTTP endpoints by area

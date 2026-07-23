@@ -32,4 +32,6 @@ COPY tsconfig.json ./
 
 EXPOSE 3000
 
-CMD ["sh", "-c", "npx prisma migrate deploy && yarn start"]
+# Keep migration and runtime startup sequential, then replace PID 1 with the
+# actual Node/tsx process so Docker SIGTERM reaches Happy's shutdown handlers.
+CMD ["sh", "-c", "npx prisma migrate deploy && exec ./node_modules/.bin/tsx ./sources/main.ts"]

@@ -1,5 +1,4 @@
 import { sessionAliveEventsCounter, websocketEventsCounter } from "@/app/monitoring/metrics2";
-import { activityCache } from "@/app/presence/sessionCache";
 import { buildUpdateSessionUpdate, ClientConnection, eventRouter } from "@/app/events/eventRouter";
 import { sessionActivityPublisher } from "@/app/presence/sessionActivityPublisher";
 import { db } from "@/storage/db";
@@ -11,12 +10,54 @@ import { Socket } from "socket.io";
 import { persistSessionMessage, SessionMessageAck, toSessionMessageAck } from "@/app/session/sessionMessageCreate";
 import { SessionMessageNotificationDispatcher } from "@/app/session/sessionMessageNotificationOutbox";
 import { parseSessionMessageLocalId } from "@/app/api/socket/sessionMessageValidation";
+import {
+    endRuntimeConnectionLease,
+    isRuntimeConnectionOwner,
+    newRuntimeConnectionLeaseTombstone,
+    renewLegacyRuntimeConnection,
+    renewRuntimeConnectionLease,
+    updateRuntimeSessionMetadata,
+    updateRuntimeSessionState,
+} from "@/app/presence/runtimeConnectionLease";
+import { rejectRuntimeConnection } from "@/app/api/socket/runtimeConnectionGuard";
 
 type SessionEndAck =
     | { result: "success"; localId: string | null }
     | { result: "error"; code: "invalid_request" | "session_not_found" | "internal_error"; retryable: boolean };
 
 export const MAX_SESSION_MESSAGE_CIPHERTEXT_BYTES = 7 * 1024 * 1024;
+
+function runtimeWriteAuthorization(
+    connection: ClientConnection,
+    sessionId: string,
+): { sessionInstanceId?: string; leaseId?: string } | null {
+    if (connection.connectionType !== "session-scoped") return {};
+    if (connection.replayOnly || connection.sessionId !== sessionId) return null;
+    if (connection.sessionInstanceId && connection.runtimeConnectionLeaseId) {
+        return {
+            sessionInstanceId: connection.sessionInstanceId,
+            leaseId: connection.runtimeConnectionLeaseId,
+        };
+    }
+    if (!connection.sessionInstanceId && !connection.runtimeConnectionLeaseId) {
+        return {};
+    }
+    return null;
+}
+
+async function stillOwnsRuntimeConnection(
+    userId: string,
+    connection: ClientConnection,
+    sessionId: string,
+): Promise<boolean> {
+    if (connection.connectionType !== "session-scoped") return true;
+    return isRuntimeConnectionOwner({
+        accountId: userId,
+        sessionId,
+        sessionInstanceId: connection.sessionInstanceId,
+        leaseId: connection.runtimeConnectionLeaseId,
+    });
+}
 
 export function sessionUpdateHandler(
     userId: string,
@@ -32,6 +73,14 @@ export function sessionUpdateHandler(
             if (!sid || typeof metadata !== 'string' || typeof expectedVersion !== 'number') {
                 if (callback) {
                     callback({ result: 'error' });
+                }
+                return;
+            }
+            const runtimeAuthorization = runtimeWriteAuthorization(connection, sid);
+            if (runtimeAuthorization === null) {
+                callback?.({ result: 'error' });
+                if (connection.connectionType === "session-scoped") {
+                    rejectRuntimeConnection(connection, "metadata write fence rejected");
                 }
                 return;
             }
@@ -51,14 +100,38 @@ export function sessionUpdateHandler(
             }
 
             // Update metadata
-            const { count } = await db.session.updateMany({
-                where: { id: sid, metadataVersion: expectedVersion },
-                data: {
-                    metadata: metadata,
-                    metadataVersion: expectedVersion + 1
-                }
-            });
+            const count = connection.connectionType === "session-scoped"
+                ? await updateRuntimeSessionMetadata({
+                    accountId: userId,
+                    sessionId: sid,
+                    ...runtimeAuthorization,
+                    expectedVersion,
+                    metadata,
+                }).then(updated => updated ? 1 : 0)
+                : (await db.session.updateMany({
+                    where: { id: sid, accountId: userId, metadataVersion: expectedVersion },
+                    data: {
+                        metadata,
+                        metadataVersion: expectedVersion + 1,
+                    },
+                })).count;
             if (count === 0) {
+                if (connection.connectionType === "session-scoped") {
+                    if (!await stillOwnsRuntimeConnection(userId, connection, sid)) {
+                        rejectRuntimeConnection(connection, "metadata write lease CAS lost");
+                        callback?.({ result: 'error' });
+                        return null;
+                    }
+                    const current = await db.session.findUnique({
+                        where: { id: sid, accountId: userId },
+                    });
+                    callback({
+                        result: 'version-mismatch',
+                        version: current?.metadataVersion ?? session.metadataVersion,
+                        metadata: current?.metadata ?? session.metadata,
+                    });
+                    return null;
+                }
                 callback({ result: 'version-mismatch', version: session.metadataVersion, metadata: session.metadata });
                 return null;
             }
@@ -97,6 +170,14 @@ export function sessionUpdateHandler(
                 }
                 return;
             }
+            const runtimeAuthorization = runtimeWriteAuthorization(connection, sid);
+            if (runtimeAuthorization === null) {
+                callback?.({ result: 'error' });
+                if (connection.connectionType === "session-scoped") {
+                    rejectRuntimeConnection(connection, "state write fence rejected");
+                }
+                return;
+            }
 
             // Resolve session
             const session = await db.session.findUnique({
@@ -117,14 +198,38 @@ export function sessionUpdateHandler(
             }
 
             // Update agent state
-            const { count } = await db.session.updateMany({
-                where: { id: sid, agentStateVersion: expectedVersion },
-                data: {
-                    agentState: agentState,
-                    agentStateVersion: expectedVersion + 1
-                }
-            });
+            const count = connection.connectionType === "session-scoped"
+                ? await updateRuntimeSessionState({
+                    accountId: userId,
+                    sessionId: sid,
+                    ...runtimeAuthorization,
+                    expectedVersion,
+                    agentState,
+                }).then(updated => updated ? 1 : 0)
+                : (await db.session.updateMany({
+                    where: { id: sid, accountId: userId, agentStateVersion: expectedVersion },
+                    data: {
+                        agentState,
+                        agentStateVersion: expectedVersion + 1,
+                    },
+                })).count;
             if (count === 0) {
+                if (connection.connectionType === "session-scoped") {
+                    if (!await stillOwnsRuntimeConnection(userId, connection, sid)) {
+                        rejectRuntimeConnection(connection, "state write lease CAS lost");
+                        callback?.({ result: 'error' });
+                        return null;
+                    }
+                    const current = await db.session.findUnique({
+                        where: { id: sid, accountId: userId },
+                    });
+                    callback({
+                        result: 'version-mismatch',
+                        version: current?.agentStateVersion ?? session.agentStateVersion,
+                        agentState: current?.agentState ?? session.agentState,
+                    });
+                    return null;
+                }
                 callback({ result: 'version-mismatch', version: session.agentStateVersion, agentState: session.agentState });
                 return null;
             }
@@ -165,38 +270,60 @@ export function sessionUpdateHandler(
             if (!data || typeof data.time !== 'number' || !data.sid) {
                 return;
             }
-
-            let t = data.time;
-            if (t > Date.now()) {
-                t = Date.now();
-            }
-            if (t < Date.now() - 1000 * 60 * 10) {
+            if (connection.connectionType !== 'session-scoped'
+                || connection.replayOnly
+                || data.sid !== connection.sessionId) {
                 return;
             }
+            const modernConnection = connection.sessionInstanceId
+                && connection.runtimeConnectionLeaseId;
+            const legacyConnection = !connection.sessionInstanceId
+                && !connection.runtimeConnectionLeaseId;
+            if (!modernConnection && !legacyConnection) return;
 
             const { sid, thinking } = data;
+            // Client time is display metadata, never lease authority. Use the
+            // server receipt clock for batching; the persisted renewal itself
+            // uses PostgreSQL CURRENT_TIMESTAMP.
+            const receivedAt = Date.now();
 
-            // Check session validity using cache
-            const isValid = await activityCache.isSessionValid(sid, userId);
-            if (!isValid) {
-                return;
+            if (connection.runtimeConnectionLeaseRejected) return;
+            if (modernConnection) {
+                const sessionInstanceId = connection.sessionInstanceId;
+                const leaseId = connection.runtimeConnectionLeaseId;
+                if (!sessionInstanceId || !leaseId) return;
+                // Renew every heartbeat directly. A shared coalescing cache
+                // cannot safely watermark two competing socket generations:
+                // a stale generation must observe its own failed exact CAS.
+                const renewed = await renewRuntimeConnectionLease({
+                    accountId: userId,
+                    sessionId: sid,
+                    sessionInstanceId,
+                    leaseId,
+                });
+                if (!renewed) {
+                    rejectRuntimeConnection(connection, "heartbeat lease CAS failed");
+                    return;
+                }
+            } else {
+                // Pre-incarnation clients can update only an untouched legacy
+                // row. They cannot revive or impersonate a managed runtime.
+                const renewed = await renewLegacyRuntimeConnection({
+                    accountId: userId,
+                    sessionId: sid,
+                });
+                if (!renewed) {
+                    rejectRuntimeConnection(connection, "legacy heartbeat CAS failed");
+                    return;
+                }
             }
-
-            // Queue database update (will only update if time difference is significant)
-            activityCache.queueSessionUpdate(
-                sid,
-                t,
-                connection.connectionType === 'session-scoped'
-                    ? connection.sessionInstanceId
-                    : undefined
-            );
 
             // Coalesce unchanged heartbeats before cross-node Redis fanout.
             sessionActivityPublisher.publish({
                 userId,
                 sessionId: sid,
                 active: true,
-                activeAt: t,
+                activeAt: receivedAt,
                 thinking: thinking || false,
             });
         } catch (error) {
@@ -225,6 +352,12 @@ export function sessionUpdateHandler(
             const localId = parsedLocalId.localId;
 
             const { sid, message } = data;
+            if (connection.connectionType === "session-scoped"
+                && sid !== connection.sessionId) {
+                callback?.({ result: 'error', code: 'invalid_request', retryable: false });
+                rejectRuntimeConnection(connection, "message targeted another session");
+                return;
+            }
             log(
                 { module: 'websocket' },
                 `Received message from socket ${socket.id}: sessionId=${sid}, messageLength=${message.length} bytes, hasLocalId=${localId !== null}, connectionType=${connection.connectionType}, connectionSessionId=${connection.connectionType === 'session-scoped' ? connection.sessionId : 'N/A'}`
@@ -236,7 +369,30 @@ export function sessionUpdateHandler(
                     sessionId: sid,
                     ciphertext: message,
                     localId,
-                    originSocketId: socket.id
+                    originSocketId: socket.id,
+                    ...(connection.connectionType !== "session-scoped"
+                        ? {}
+                        : connection.replayOnly
+                            ? {
+                                runtimeAuthorization: {
+                                    type: "replay" as const,
+                                    ...(connection.sessionInstanceId
+                                        ? { sessionInstanceId: connection.sessionInstanceId }
+                                        : {}),
+                                    ...(connection.runtimeConnectionLeaseId
+                                        ? { leaseId: connection.runtimeConnectionLeaseId }
+                                        : {}),
+                                },
+                            }
+                            : connection.sessionInstanceId && connection.runtimeConnectionLeaseId
+                                ? {
+                                    runtimeAuthorization: {
+                                        type: "lease" as const,
+                                        sessionInstanceId: connection.sessionInstanceId,
+                                        leaseId: connection.runtimeConnectionLeaseId,
+                                    },
+                                }
+                                : { runtimeAuthorization: { type: "legacy" as const } }),
                 });
 
                 if (result.result === 'success') {
@@ -248,6 +404,11 @@ export function sessionUpdateHandler(
 
                 // persistSessionMessage returns only after its database transaction commits.
                 callback?.(toSessionMessageAck(result));
+                if (result.result === "error"
+                    && result.code === "runtime_connection_stale"
+                    && connection.connectionType === "session-scoped") {
+                    rejectRuntimeConnection(connection, "message transaction lease fence failed");
+                }
             } catch (error) {
                 log({ module: 'websocket', level: 'error' }, `Error in message handler: ${error}`);
                 callback?.({ result: 'error', code: 'internal_error', retryable: true });
@@ -270,6 +431,11 @@ export function sessionUpdateHandler(
                 callback?.({ result: 'error', code: 'invalid_request', retryable: false });
                 return;
             }
+            if (connection.connectionType !== 'session-scoped'
+                || data.sid !== connection.sessionId) {
+                callback?.({ result: 'error', code: 'invalid_request', retryable: false });
+                return;
+            }
             const parsedLocalId = parseSessionMessageLocalId(data.localId);
             const parsedSessionInstanceId = parseSessionMessageLocalId(data.sessionInstanceId);
             if (!parsedLocalId.valid
@@ -279,7 +445,23 @@ export function sessionUpdateHandler(
                 return;
             }
             const localId = parsedLocalId.localId;
-            const sessionInstanceId = parsedSessionInstanceId.localId;
+            const requestedSessionInstanceId = parsedSessionInstanceId.localId;
+            if (connection.replayOnly
+                ? requestedSessionInstanceId !== (connection.replayRequestedSessionInstanceId ?? null)
+                : requestedSessionInstanceId !== (connection.sessionInstanceId ?? null)) {
+                callback?.({ result: 'error', code: 'invalid_request', retryable: false });
+                return;
+            }
+            const sessionInstanceId = connection.replayOnly
+                ? requestedSessionInstanceId ?? connection.sessionInstanceId ?? null
+                : requestedSessionInstanceId;
+            if (connection.replayOnly && sessionInstanceId === null) {
+                // A no-ID replay transport that could not infer/claim an
+                // incarnation is duplicate-only. Its terminal marker is an
+                // idempotent no-op, never a legacy timestamp-fenced end.
+                callback?.({ result: 'success', localId });
+                return;
+            }
             const { sid, time } = data;
             let t = time;
             if (t > Date.now()) {
@@ -294,27 +476,43 @@ export function sessionUpdateHandler(
                 return;
             }
 
-            const endedAt = sessionInstanceId ? Date.now() : t;
             // Durable producers are fenced by a server-persisted runtime
             // incarnation. Legacy producers retain the timestamp fence.
-            const ended = await db.session.updateMany({
-                where: {
-                    id: sid,
+            const modernEndedAt = sessionInstanceId
+                ? await endRuntimeConnectionLease({
                     accountId: userId,
-                    ...(sessionInstanceId
-                        ? {
-                            activeInstanceId: sessionInstanceId,
-                            active: true,
-                        }
-                        : { lastActiveAt: { lte: new Date(t) } }),
-                },
-                data: {
-                    lastActiveAt: new Date(endedAt),
-                    active: false,
-                }
-            });
+                    sessionId: sid,
+                    sessionInstanceId,
+                })
+                : null;
+            const legacyEnded = sessionInstanceId
+                ? null
+                : await db.session.updateMany({
+                    where: {
+                        id: sid,
+                        accountId: userId,
+                        lastActiveAt: { lte: new Date(t) },
+                        activeInstanceId: null,
+                        // Once a row has entered the lease protocol, only an
+                        // incarnation-fenced modern end may terminate it.
+                        runtimeConnectionLeaseId: null,
+                        runtimeConnectionLeaseInstanceId: null,
+                        runtimeConnectionLeaseExpiresAt: null,
+                    },
+                    data: {
+                        lastActiveAt: new Date(t),
+                        active: false,
+                        // A tombstone prevents a lease-aware reader from ever
+                        // falling back after this explicit terminal marker.
+                        runtimeConnectionLeaseId: newRuntimeConnectionLeaseTombstone(),
+                        runtimeConnectionLeaseInstanceId: null,
+                        runtimeConnectionLeaseExpiresAt: new Date(t),
+                    },
+                });
+            const endedAt = modernEndedAt?.getTime() ?? t;
+            const didEnd = modernEndedAt !== null || (legacyEnded?.count ?? 0) > 0;
 
-            if (ended.count > 0) {
+            if (didEnd) {
                 // Emit session activity update only when this marker actually
                 // won the timestamp fence. Stale retries are successful no-ops.
                 sessionActivityPublisher.publish({

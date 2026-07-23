@@ -18,6 +18,8 @@ function notification(overrides: Partial<ClaimedSessionMessageNotification> = {}
         messageId: "message-1",
         updateSeq: 31,
         originSocketId: "socket-1",
+        targetRuntimeConnectionLeaseId: "lease-1",
+        targetLegacyRuntimeConnection: false,
         attempts: 1,
         claimToken: "claim-1",
         message: {

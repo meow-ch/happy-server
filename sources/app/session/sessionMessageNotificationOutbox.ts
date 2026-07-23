@@ -11,6 +11,8 @@ export interface ClaimedSessionMessageNotification {
     messageId: string;
     updateSeq: number;
     originSocketId: string | null;
+    targetRuntimeConnectionLeaseId: string | null;
+    targetLegacyRuntimeConnection: boolean;
     attempts: number;
     claimToken: string;
     message: {
@@ -105,6 +107,8 @@ export const sessionMessageNotificationRepository: SessionMessageNotificationRep
                     messageId: true,
                     updateSeq: true,
                     originSocketId: true,
+                    targetRuntimeConnectionLeaseId: true,
+                    targetLegacyRuntimeConnection: true,
                     attempts: true,
                     claimToken: true,
                     message: {
@@ -264,7 +268,9 @@ export class SessionMessageNotificationDispatcher {
                     await this.publish({
                         userId: notification.accountId,
                         payload,
-                        originSocketId: notification.originSocketId
+                        originSocketId: notification.originSocketId,
+                        targetRuntimeConnectionLeaseId: notification.targetRuntimeConnectionLeaseId,
+                        targetLegacyRuntimeConnection: notification.targetLegacyRuntimeConnection,
                     });
                     await this.repository.markDelivered(notification, this.now());
                 } catch (error) {

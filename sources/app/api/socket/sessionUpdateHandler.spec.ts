@@ -7,23 +7,31 @@ const mocks = vi.hoisted(() => ({
     sessionFindUnique: vi.fn(),
     sessionUpdateMany: vi.fn(),
     emitEphemeral: vi.fn(),
-    isSessionValid: vi.fn(),
-    queueSessionUpdate: vi.fn(),
-    publishSessionActivity: vi.fn()
+    publishSessionActivity: vi.fn(),
+    endRuntimeConnectionLease: vi.fn(),
+    renewRuntimeConnectionLease: vi.fn(),
+    renewLegacyRuntimeConnection: vi.fn(),
+    isRuntimeConnectionOwner: vi.fn(),
+    updateRuntimeSessionMetadata: vi.fn(),
+    updateRuntimeSessionState: vi.fn(),
+    newRuntimeConnectionLeaseTombstone: vi.fn(() => "lease-tombstone"),
 }));
 
 vi.mock("@/app/monitoring/metrics2", () => ({
     sessionAliveEventsCounter: { inc: vi.fn() },
     websocketEventsCounter: { inc: vi.fn() }
 }));
-vi.mock("@/app/presence/sessionCache", () => ({
-    activityCache: {
-        isSessionValid: mocks.isSessionValid,
-        queueSessionUpdate: mocks.queueSessionUpdate
-    }
-}));
 vi.mock("@/app/presence/sessionActivityPublisher", () => ({
     sessionActivityPublisher: { publish: mocks.publishSessionActivity }
+}));
+vi.mock("@/app/presence/runtimeConnectionLease", () => ({
+    endRuntimeConnectionLease: mocks.endRuntimeConnectionLease,
+    renewRuntimeConnectionLease: mocks.renewRuntimeConnectionLease,
+    renewLegacyRuntimeConnection: mocks.renewLegacyRuntimeConnection,
+    isRuntimeConnectionOwner: mocks.isRuntimeConnectionOwner,
+    updateRuntimeSessionMetadata: mocks.updateRuntimeSessionMetadata,
+    updateRuntimeSessionState: mocks.updateRuntimeSessionState,
+    newRuntimeConnectionLeaseTombstone: mocks.newRuntimeConnectionLeaseTombstone,
 }));
 vi.mock("@/app/events/eventRouter", () => ({
     buildSessionActivityEphemeral: vi.fn(),
@@ -68,22 +76,42 @@ function success(id: string, seq: number) {
     };
 }
 
-function createHarness() {
+function createHarness(connectionOverride?: Record<string, unknown>) {
     const handlers = new Map<string, (...args: any[]) => any>();
     const socket = {
         id: "socket-1",
+        disconnect: vi.fn(),
         on: vi.fn((event: string, handler: (...args: any[]) => any) => handlers.set(event, handler))
     };
     const dispatcher = {
         wake: vi.fn()
     };
+    const connection = {
+        ...(connectionOverride ?? {
+            connectionType: "user-scoped",
+            userId: "account-1",
+        }),
+        socket,
+    };
     sessionUpdateHandler(
         "account-1",
         socket as never,
-        { connectionType: "user-scoped", socket, userId: "account-1" } as never,
+        connection as never,
         dispatcher as never
     );
-    return { handlers, dispatcher };
+    return { handlers, dispatcher, socket, connection };
+}
+
+function createSessionHarness() {
+    return createHarness({
+        connectionType: "session-scoped",
+        socket: { id: "socket-1" },
+        userId: "account-1",
+        sessionId: "session-1",
+        sessionInstanceId: "8c46b5ad-4155-47ed-a470-d21c7be49baf",
+        runtimeConnectionLeaseId: "lease-generation-1",
+        replayOnly: false,
+    });
 }
 
 describe("session message socket handler", () => {
@@ -94,9 +122,14 @@ describe("session message socket handler", () => {
         mocks.sessionFindUnique.mockReset();
         mocks.sessionUpdateMany.mockReset();
         mocks.emitEphemeral.mockReset();
-        mocks.isSessionValid.mockReset();
-        mocks.queueSessionUpdate.mockReset();
         mocks.publishSessionActivity.mockReset();
+        mocks.endRuntimeConnectionLease.mockReset();
+        mocks.renewRuntimeConnectionLease.mockReset();
+        mocks.renewLegacyRuntimeConnection.mockReset();
+        mocks.isRuntimeConnectionOwner.mockReset();
+        mocks.updateRuntimeSessionMetadata.mockReset();
+        mocks.updateRuntimeSessionState.mockReset();
+        mocks.newRuntimeConnectionLeaseTombstone.mockClear();
     });
 
     it("preserves socket receive order while asynchronous commits are in flight", async () => {
@@ -187,32 +220,149 @@ describe("session message socket handler", () => {
         expect(callback).toHaveBeenCalledWith({ result: "success" });
     });
 
-    it("queues every valid heartbeat but delegates Redis publication to the coalescer", async () => {
-        mocks.isSessionValid.mockResolvedValue(true);
-        const { handlers } = createHarness();
-        const heartbeatAt = Date.now();
+    it("renews every heartbeat through the exact socket-generation CAS", async () => {
+        mocks.renewRuntimeConnectionLease.mockResolvedValue(true);
+        const receivedAt = 1_753_200_000_000;
+        const now = vi.spyOn(Date, "now").mockReturnValue(receivedAt);
+        const { handlers } = createSessionHarness();
 
         await handlers.get("session-alive")?.({
             sid: "session-1",
-            time: heartbeatAt,
+            time: 1,
             thinking: true
         });
 
-        expect(mocks.queueSessionUpdate).toHaveBeenCalledWith("session-1", heartbeatAt, undefined);
+        expect(mocks.renewRuntimeConnectionLease).toHaveBeenCalledWith({
+            accountId: "account-1",
+            sessionId: "session-1",
+            sessionInstanceId: "8c46b5ad-4155-47ed-a470-d21c7be49baf",
+            leaseId: "lease-generation-1",
+        });
         expect(mocks.publishSessionActivity).toHaveBeenCalledWith({
             userId: "account-1",
             sessionId: "session-1",
             active: true,
-            activeAt: heartbeatAt,
+            activeAt: receivedAt,
             thinking: true
         });
+        now.mockRestore();
+    });
+
+    it("allows a legacy session heartbeat only through the lease-null CAS path", async () => {
+        mocks.renewLegacyRuntimeConnection.mockResolvedValue(true);
+        const receivedAt = 1_753_200_000_000;
+        const now = vi.spyOn(Date, "now").mockReturnValue(receivedAt);
+        const { handlers } = createHarness({
+            connectionType: "session-scoped",
+            userId: "account-1",
+            sessionId: "session-1",
+            replayOnly: false,
+        });
+
+        await handlers.get("session-alive")?.({
+            sid: "session-1",
+            time: 1,
+            thinking: false,
+        });
+
+        expect(mocks.renewLegacyRuntimeConnection).toHaveBeenCalledWith({
+            accountId: "account-1",
+            sessionId: "session-1",
+        });
+        now.mockRestore();
+    });
+
+    it("suppresses a stale generation while the winning generation keeps renewing", async () => {
+        mocks.renewRuntimeConnectionLease
+            .mockResolvedValueOnce(false)
+            .mockResolvedValue(true);
+        const stale = createHarness({
+            connectionType: "session-scoped",
+            userId: "account-1",
+            sessionId: "session-1",
+            sessionInstanceId: "8c46b5ad-4155-47ed-a470-d21c7be49baf",
+            runtimeConnectionLeaseId: "old-lease",
+            replayOnly: false,
+        });
+        const winner = createHarness({
+            connectionType: "session-scoped",
+            userId: "account-1",
+            sessionId: "session-1",
+            sessionInstanceId: "8c46b5ad-4155-47ed-a470-d21c7be49baf",
+            runtimeConnectionLeaseId: "new-lease",
+            replayOnly: false,
+        });
+
+        await stale.handlers.get("session-alive")?.({ sid: "session-1", time: 1 });
+        await stale.handlers.get("session-alive")?.({ sid: "session-1", time: 2 });
+        await winner.handlers.get("session-alive")?.({ sid: "session-1", time: 3 });
+        await winner.handlers.get("session-alive")?.({ sid: "session-1", time: 4 });
+
+        expect(mocks.renewRuntimeConnectionLease).toHaveBeenCalledTimes(3);
+        expect(stale.socket.disconnect).toHaveBeenCalledWith(true);
+        expect(winner.socket.disconnect).not.toHaveBeenCalled();
+        expect(mocks.publishSessionActivity).toHaveBeenCalledTimes(2);
+    });
+
+    it("does not let a user-scoped socket renew runtime presence", async () => {
+        const { handlers } = createHarness();
+
+        await handlers.get("session-alive")?.({
+            sid: "session-1",
+            time: Date.now(),
+        });
+
+        expect(mocks.renewRuntimeConnectionLease).not.toHaveBeenCalled();
+        expect(mocks.renewLegacyRuntimeConnection).not.toHaveBeenCalled();
+    });
+
+    it("passes exact lease authorization into message persistence and rejects another sid", async () => {
+        mocks.persistSessionMessage.mockResolvedValue(success("message-1", 1));
+        const valid = createSessionHarness();
+        await valid.handlers.get("message")?.({
+            sid: "session-1",
+            message: "ciphertext",
+            localId: "4de09f61-dc78-4d4f-8a20-6a72c44cb3e3",
+        }, vi.fn());
+        expect(mocks.persistSessionMessage).toHaveBeenCalledWith(expect.objectContaining({
+            runtimeAuthorization: {
+                type: "lease",
+                sessionInstanceId: "8c46b5ad-4155-47ed-a470-d21c7be49baf",
+                leaseId: "lease-generation-1",
+            },
+        }));
+
+        mocks.persistSessionMessage.mockClear();
+        const wrongSession = createSessionHarness();
+        await wrongSession.handlers.get("message")?.({
+            sid: "session-2",
+            message: "ciphertext",
+        }, vi.fn());
+        expect(mocks.persistSessionMessage).not.toHaveBeenCalled();
+        expect(wrongSession.socket.disconnect).toHaveBeenCalledWith(true);
+    });
+
+    it("disconnects when the row-locked message lease fence loses a claim race", async () => {
+        mocks.persistSessionMessage.mockResolvedValue({
+            result: "error",
+            code: "runtime_connection_stale",
+            retryable: true,
+        });
+        const harness = createSessionHarness();
+        await harness.handlers.get("message")?.({
+            sid: "session-1",
+            message: "ciphertext",
+        }, vi.fn());
+        expect(harness.socket.disconnect).toHaveBeenCalledWith(true);
+        expect(harness.dispatcher.wake).not.toHaveBeenCalled();
     });
 
     it("acknowledges session-end only after the inactive state is persisted", async () => {
         const localId = "16cc3995-c10f-43c0-8dbd-95ef41f924a7";
         mocks.sessionFindUnique.mockResolvedValue({ id: "session-1" });
-        mocks.sessionUpdateMany.mockResolvedValue({ count: 1 });
-        const { handlers } = createHarness();
+        const endedAt = new Date("2026-07-22T18:00:00.000Z");
+        mocks.endRuntimeConnectionLease.mockResolvedValue(endedAt);
+        const { handlers } = createSessionHarness();
         const callback = vi.fn();
 
         await handlers.get("session-end")?.({
@@ -222,31 +372,27 @@ describe("session message socket handler", () => {
             sessionInstanceId: "8c46b5ad-4155-47ed-a470-d21c7be49baf"
         }, callback);
 
-        expect(mocks.sessionUpdateMany).toHaveBeenCalledWith({
-            where: {
-                id: "session-1",
-                accountId: "account-1",
-                activeInstanceId: "8c46b5ad-4155-47ed-a470-d21c7be49baf",
-                active: true
-            },
-            data: { lastActiveAt: expect.any(Date), active: false }
+        expect(mocks.endRuntimeConnectionLease).toHaveBeenCalledWith({
+            accountId: "account-1",
+            sessionId: "session-1",
+            sessionInstanceId: "8c46b5ad-4155-47ed-a470-d21c7be49baf",
         });
         expect(callback).toHaveBeenCalledWith({ result: "success", localId });
-        expect(mocks.sessionUpdateMany.mock.invocationCallOrder[0])
+        expect(mocks.endRuntimeConnectionLease.mock.invocationCallOrder[0])
             .toBeLessThan(callback.mock.invocationCallOrder[0]);
     });
 
     it("returns retryable session-end errors without a false ACK", async () => {
         mocks.sessionFindUnique.mockResolvedValue({ id: "session-1" });
-        mocks.sessionUpdateMany.mockRejectedValue(new Error("database unavailable"));
-        const { handlers } = createHarness();
+        mocks.endRuntimeConnectionLease.mockRejectedValue(new Error("database unavailable"));
+        const { handlers } = createSessionHarness();
         const callback = vi.fn();
 
         await handlers.get("session-end")?.({
             sid: "session-1",
             time: Date.now(),
             localId: "54d48b15-9100-4865-985d-2e61cba5d6b9",
-            sessionInstanceId: "984b458d-3e0b-456a-b849-c9d630559bd8"
+            sessionInstanceId: "8c46b5ad-4155-47ed-a470-d21c7be49baf"
         }, callback);
 
         expect(callback).toHaveBeenCalledWith({
@@ -259,18 +405,40 @@ describe("session message socket handler", () => {
     it("ACKs a stale session-end retry without ending a newer session", async () => {
         const localId = "eaa36e46-d645-4f8c-943a-131a6af0a477";
         mocks.sessionFindUnique.mockResolvedValue({ id: "session-1" });
-        mocks.sessionUpdateMany.mockResolvedValue({ count: 0 });
-        const { handlers } = createHarness();
+        mocks.endRuntimeConnectionLease.mockResolvedValue(null);
+        const { handlers } = createSessionHarness();
         const callback = vi.fn();
 
         await handlers.get("session-end")?.({
             sid: "session-1",
             time: 100,
             localId,
-            sessionInstanceId: "6bb900b4-b4bf-4ba7-8b7b-98e399a58024"
+            sessionInstanceId: "8c46b5ad-4155-47ed-a470-d21c7be49baf"
         }, callback);
 
         expect(callback).toHaveBeenCalledWith({ result: "success", localId });
+        expect(mocks.publishSessionActivity).not.toHaveBeenCalled();
+    });
+
+    it("treats a duplicate-only no-ID replay end as an idempotent no-op", async () => {
+        const localId = "eaa36e46-d645-4f8c-943a-131a6af0a477";
+        mocks.sessionFindUnique.mockResolvedValue({ id: "session-1" });
+        mocks.sessionUpdateMany.mockResolvedValue({ count: 0 });
+        const { handlers } = createHarness({
+            connectionType: "session-scoped",
+            userId: "account-1",
+            sessionId: "session-1",
+            replayOnly: true,
+        });
+        const callback = vi.fn();
+
+        await handlers.get("session-end")?.({
+            sid: "session-1",
+            time: Date.now(),
+        }, callback);
+
+        expect(mocks.sessionUpdateMany).not.toHaveBeenCalled();
+        expect(callback).toHaveBeenCalledWith({ result: "success", localId: null });
         expect(mocks.publishSessionActivity).not.toHaveBeenCalled();
     });
 });

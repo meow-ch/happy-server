@@ -1,9 +1,15 @@
 import { onShutdown } from "@/utils/shutdown";
 import { Fastify } from "./types";
-import { buildMachineActivityEphemeral, ClientConnection, eventRouter, getConnectionRooms } from "@/app/events/eventRouter";
+import {
+    buildMachineActivityEphemeral,
+    ClientConnection,
+    eventRouter,
+    getConnectionRooms,
+    getRuntimeConnectionLeaseRoom,
+} from "@/app/events/eventRouter";
 import { Server } from "socket.io";
 import { createAdapter } from "@socket.io/redis-adapter";
-import { redis } from "@/storage/redis";
+import { redis, rpcRegistrationRedis } from "@/storage/redis";
 import { log } from "@/utils/log";
 import { auth } from "@/app/auth/auth";
 import { decrementWebSocketConnection, incrementWebSocketConnection, websocketEventsCounter } from "../monitoring/metrics2";
@@ -20,9 +26,13 @@ import {
     sessionMessageNotificationRepository
 } from "@/app/session/sessionMessageNotificationOutbox";
 import { parseSessionMessageLocalId } from "@/app/api/socket/sessionMessageValidation";
-import { db } from "@/storage/db";
 import type { RpcHandlerLifecycle } from "@/app/api/socket/rpcHandler";
 import { shutdownSocketRuntime } from "@/app/api/socket/shutdownSocketRuntime";
+import {
+    claimRuntimeConnectionLease,
+    expireRuntimeConnectionLease,
+} from "@/app/presence/runtimeConnectionLease";
+import { installRuntimeConnectionPacketFence } from "@/app/api/socket/runtimeConnectionGuard";
 
 export async function startSocket(app: Fastify) {
     const socketPublisherRedis = redis.duplicate({ lazyConnect: true });
@@ -34,6 +44,7 @@ export async function startSocket(app: Fastify) {
         socketSubscriberRedis,
         notificationPublisherRedis,
         notificationSubscriberRedis,
+        rpcRegistrationRedis,
     ];
     // Connect each Redis transport before constructing the adapters.
     await Promise.all(realtimeRedisClients.map((client) => client.connect()));
@@ -116,35 +127,43 @@ export async function startSocket(app: Fastify) {
             }
             if (clientType === 'session-scoped'
                 && typeof sessionId === 'string'
-                && parsedSessionInstanceId.localId) {
+                && (parsedSessionInstanceId.localId || replayOnly)) {
                 // Claim the runtime incarnation before Socket.IO emits CONNECT.
                 // Awaiting this inside the connection callback would leave a
                 // window where client packets arrive before handlers exist.
-                const claimed = replayOnly
-                    ? await db.session.updateMany({
-                        where: {
-                            id: sessionId,
-                            accountId: verified.userId,
-                            activeInstanceId: null,
-                        },
-                        data: { activeInstanceId: parsedSessionInstanceId.localId },
-                    })
-                    : await db.session.updateMany({
-                        where: { id: sessionId, accountId: verified.userId },
-                        data: {
-                            activeInstanceId: parsedSessionInstanceId.localId,
-                            active: true,
-                            lastActiveAt: new Date(),
-                        },
-                    });
-                if (!replayOnly && claimed.count === 0) {
+                const claim = await claimRuntimeConnectionLease({
+                    accountId: verified.userId,
+                    sessionId,
+                    sessionInstanceId: parsedSessionInstanceId.localId ?? undefined,
+                    replayOnly,
+                });
+                if (!replayOnly && !claim.claimed) {
                     next(new Error('Session not found'));
                     return;
                 }
+                if (claim.displacedLeaseId
+                    && claim.displacedLeaseId !== claim.ownedLeaseId) {
+                    // Evict exactly the generation replaced by this claim.
+                    // Never target the broad session room: a delayed adapter
+                    // command must not disconnect the new winner.
+                    io.in(getRuntimeConnectionLeaseRoom(
+                        verified.userId,
+                        sessionId,
+                        claim.displacedLeaseId,
+                    )).disconnectSockets(true);
+                }
+                socket.data.runtimeConnectionLeaseId = claim.ownedLeaseId;
+                socket.data.sessionInstanceId = claim.ownedSessionInstanceId
+                    ?? parsedSessionInstanceId.localId;
             }
             socket.data.userId = verified.userId;
-            socket.data.sessionInstanceId = parsedSessionInstanceId.localId;
+            if (socket.data.sessionInstanceId === undefined) {
+                socket.data.sessionInstanceId = parsedSessionInstanceId.localId;
+            }
             socket.data.replayOnly = replayOnly;
+            socket.data.replayRequestedSessionInstanceId = replayOnly
+                ? parsedSessionInstanceId.localId
+                : undefined;
             next();
         } catch (error) {
             log({ module: 'websocket', level: 'error' }, `Socket authentication failed: ${error}`);
@@ -166,7 +185,9 @@ export async function startSocket(app: Fastify) {
         const machineId = socket.handshake.auth.machineId as string | undefined;
         const userId = socket.data.userId as string;
         const sessionInstanceId = socket.data.sessionInstanceId as string | null | undefined;
+        const runtimeConnectionLeaseId = socket.data.runtimeConnectionLeaseId as string | undefined;
         const replayOnly = socket.data.replayOnly === true;
+        const replayRequestedSessionInstanceId = socket.data.replayRequestedSessionInstanceId as string | null | undefined;
         log({ module: 'websocket' }, `Token verified: ${userId}, clientType: ${clientType || 'user-scoped'}, sessionId: ${sessionId || 'none'}, machineId: ${machineId || 'none'}, socketId: ${socket.id}`);
 
         // Store connection based on type
@@ -179,7 +200,10 @@ export async function startSocket(app: Fastify) {
                 userId,
                 sessionId,
                 sessionInstanceId: sessionInstanceId ?? undefined,
+                runtimeConnectionLeaseId,
+                runtimeConnectionLeaseRejected: false,
                 replayOnly,
+                replayRequestedSessionInstanceId,
             };
         } else if (metadata.clientType === 'machine-scoped' && machineId) {
             connection = {
@@ -195,7 +219,9 @@ export async function startSocket(app: Fastify) {
                 userId
             };
         }
-        await socket.join(getConnectionRooms(connection));
+        const connectionRooms = getConnectionRooms(connection);
+        if (connectionRooms.length > 0) await socket.join(connectionRooms);
+        installRuntimeConnectionPacketFence(connection);
         eventRouter.addConnection(userId, connection);
         incrementWebSocketConnection(connection.connectionType);
 
@@ -219,6 +245,26 @@ export async function startSocket(app: Fastify) {
 
             log({ module: 'websocket' }, `User disconnected: ${userId}`);
 
+            if (connection.connectionType === 'session-scoped'
+                && connection.sessionInstanceId
+                && connection.runtimeConnectionLeaseId) {
+                // This is best-effort for a fast negative transition. If the
+                // database or this server is lost, the persisted lease still
+                // expires on its own. The lease-id CAS prevents an older
+                // socket's late disconnect from clearing a newer reconnect.
+                void expireRuntimeConnectionLease({
+                    accountId: userId,
+                    sessionId: connection.sessionId,
+                    sessionInstanceId: connection.sessionInstanceId,
+                    leaseId: connection.runtimeConnectionLeaseId,
+                }).catch((error) => {
+                    log(
+                        { module: 'websocket', level: 'error' },
+                        `Failed to expire runtime connection lease for session ${connection.sessionId}: ${error}`,
+                    );
+                });
+            }
+
             // Broadcast daemon offline status
             if (connection.connectionType === 'machine-scoped') {
                 const machineActivity = buildMachineActivityEphemeral(connection.machineId, false, Date.now());
@@ -231,12 +277,12 @@ export async function startSocket(app: Fastify) {
         });
 
         // Handlers
-        const rpcLifecycle = rpcHandler(userId, socket);
+        const rpcLifecycle = rpcHandler(userId, socket, undefined, connection);
         rpcLifecycles.add(rpcLifecycle);
         socket.on("disconnect", () => {
             void rpcLifecycle.close().finally(() => rpcLifecycles.delete(rpcLifecycle));
         });
-        usageHandler(userId, socket);
+        usageHandler(userId, socket, connection);
         sessionUpdateHandler(userId, socket, connection, notificationDispatcher);
         pingHandler(socket);
         machineUpdateHandler(userId, socket);

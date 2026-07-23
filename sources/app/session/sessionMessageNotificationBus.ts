@@ -10,6 +10,9 @@ function isNotification(value: unknown): value is DurableSessionMessageNotificat
     const candidate = value as Record<string, unknown>;
     if (typeof candidate.userId !== "string") return false;
     if (candidate.originSocketId !== null && typeof candidate.originSocketId !== "string") return false;
+    if (candidate.targetRuntimeConnectionLeaseId !== null
+        && typeof candidate.targetRuntimeConnectionLeaseId !== "string") return false;
+    if (typeof candidate.targetLegacyRuntimeConnection !== "boolean") return false;
     if (!candidate.payload || typeof candidate.payload !== "object") return false;
     const payload = candidate.payload as Record<string, unknown>;
     return typeof payload.id === "string" && typeof payload.seq === "number" && !!payload.body;

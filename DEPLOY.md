@@ -2,7 +2,7 @@
 
 ## Overview
 
-Deployed to standalone node (ov8374) via Drone CI.
+Deployed to standalone node `sn208133` via Drone CI.
 
 - **Branch:** `master` (prod)
 - **Domain:** server.boujot.com
@@ -28,8 +28,8 @@ cd /Volumes/AppleFS/kDrive/Documents/workspace/ansible/ansible-platform
 OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES ansible-playbook playbooks/46_vault_project_approle.yml \
   -e repo_name=happy \
   -e repo_path=/Volumes/AppleFS/kDrive/Documents/workspace/happy \
-  -e 'repo_targets=["ov8374"]' \
-  -e deploy_key_scope=standalone
+  -e 'repo_targets=["sn208133"]' \
+  -e deploy_key_scope=standalone-sn208133
 ```
 
 ### 2. Push secrets to Vault
@@ -60,7 +60,7 @@ export ANSIBLE_INFRA_OPS_PATH=/Volumes/AppleFS/kDrive/Documents/workspace/ansibl
 ### 5. Update DNS
 
 ```bash
-./scripts/dns-api.sh set zivili.ch ov8374 --record happy --make-unique
+./scripts/dns-api.sh set zivili.ch sn208133 --record happy --make-unique
 ```
 
 ### 6. Create external volumes on server
@@ -68,7 +68,7 @@ export ANSIBLE_INFRA_OPS_PATH=/Volumes/AppleFS/kDrive/Documents/workspace/ansibl
 Postgres and MinIO volumes are `external: true` to prevent accidental deletion with `docker compose down -v`. Redis uses the Compose-managed named volume `happy_redis_data`, which is created automatically on the first deploy.
 
 ```bash
-ssh g@ov8374 "docker volume create happy_postgres_data && docker volume create happy_minio_data"
+ssh g@sn208133 "docker volume create happy_postgres_data && docker volume create happy_minio_data"
 ```
 
 ## Deploying Changes
@@ -80,9 +80,52 @@ git push sn1994 master
 ```
 
 Realtime reliability releases that introduce the message outbox, Pub/Sub rooms,
-or runtime-incarnation fencing are not compatible with old server pods. Apply
-the additive Prisma migrations first, then drain all old pods before routing
-clients to the new version; do not run a mixed-version realtime fleet.
+or runtime-incarnation fencing are not compatible with old server pods. Stop
+and drain every old writer first, apply the additive Prisma migrations while no
+server is accepting traffic, and only then start the protocol-v1 server. Do not
+run a mixed-version realtime fleet or allow old-writer traffic after migration.
+
+Once a protocol-v1 server has accepted runtime traffic or written runtime-lease
+state, do not restart an older binary against that database. Recover by rolling
+forward to another v1-compatible build. If an old-binary downgrade is
+unavoidable, first stop and drain every runtime and treat the downgrade as a
+maintenance operation. The deploy engine may restore the previous image when a
+configured health check fails, so automatic health-check rollback remains
+disabled for this rollout. Verify HTTP health, the v1 lease response, and one
+Socket.IO runtime round trip manually; recover from any failure by rolling
+forward.
+
+### Protocol-v1 smoke check
+
+Use a real authenticated session/runtime; do not substitute a database edit for
+the Socket.IO check.
+
+```bash
+export HAPPY_SMOKE_TOKEN='<bearer token for the test account>'
+export HAPPY_SMOKE_SESSION_ID='<live Boujot session id>'
+
+curl -fsS https://server.boujot.com/health \
+  | jq -e '.status == "ok"'
+
+curl -fsS \
+  -H "Authorization: Bearer ${HAPPY_SMOKE_TOKEN}" \
+  "https://server.boujot.com/v1/sessions/${HAPPY_SMOKE_SESSION_ID}" \
+  | tee /tmp/happy-v1-session.json \
+  | jq -e '.session.runtimeConnectionProtocolVersion == 1
+           and .session.runtimeConnected == true
+           and (.session.runtimeLeaseExpiresAt | type == "number")
+           and (.session.runtimeConnectionCheckedAt | type == "number")'
+
+boujot daemon status
+
+ssh g@sn208133 \
+  "cd /home/drone/apps/happy-server && docker compose ps && docker compose logs --since=5m app"
+```
+
+Finally, send one uniquely tagged read-only prompt to that session from Agent
+Plane and require its response to appear without refresh or recovery controls.
+Re-run the authenticated session query and require `runtimeConnected == true`.
+Any failed check is a roll-forward condition; do not restart the pre-v1 image.
 
 ## Updating Secrets
 
@@ -101,8 +144,8 @@ git push sn1994 master
 ## Monitoring
 
 - Drone CI: https://drone.sn1994.zivili.ch/meow/happy
-- Check containers: `ssh g@ov8374 "docker ps | grep happy"`
-- App logs: `ssh g@ov8374 "docker logs happy_app_1"`
+- Check containers: `ssh g@sn208133 "docker ps | grep happy"`
+- App logs: `ssh g@sn208133 "docker logs happy_app_1"`
 
 ## Lessons Learned
 

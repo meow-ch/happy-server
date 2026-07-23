@@ -3,9 +3,16 @@ import type {
     RpcRegistrationLifecycle,
     RpcRegistrationTarget,
 } from "@/app/api/socket/rpcRegistrationRegistry";
+import {
+    RpcRegistrationCancelledError,
+    RpcRegistrationOwnershipLostError,
+} from "@/app/api/socket/rpcRegistrationRegistry";
 import { log } from "@/utils/log";
 import { Socket } from "socket.io";
 import { validate as validateUuid } from "uuid";
+import type { ClientConnection } from "@/app/events/eventRouter";
+import { runWithRuntimeConnectionOwnerLock } from "@/app/presence/runtimeConnectionLease";
+import { rejectRuntimeConnection } from "@/app/api/socket/runtimeConnectionGuard";
 
 const MAX_RPC_METHOD_LENGTH = 512;
 export const MAX_RPC_PARAMS_BYTES = 4 * 1024 * 1024;
@@ -67,6 +74,24 @@ async function emitToSelectedTarget(
     return responses[0];
 }
 
+async function emitToLocalRuntimeTarget(
+    socket: Socket,
+    target: RpcRegistrationTarget,
+    request: { method: string; params: unknown; callId?: string },
+): Promise<{ dispatched: false } | { dispatched: true; response: unknown }> {
+    // A Redis adapter PUBLISH cannot be cancelled once written, even if its
+    // local promise later times out. Runtime-owned RPC therefore stays on this
+    // server and is emitted directly while the DB owner lock is held. Current
+    // production is one replica; a future multi-replica design needs a
+    // receiver-side relay that reacquires this same owner fence.
+    const targetSocket = socket.nsp.sockets.get(target.socketId);
+    if (!targetSocket) return { dispatched: false };
+    const response = await targetSocket
+        .timeout(RPC_TARGET_ACK_TIMEOUT_MS)
+        .emitWithAck("rpc-request", request);
+    return { dispatched: true, response };
+}
+
 /**
  * Install RPC handlers and return the lifecycle so startSocket can await its
  * compare-delete cleanup during shutdown if desired. Disconnect cleanup is also
@@ -75,8 +100,27 @@ async function emitToSelectedTarget(
 export function rpcHandler(
     userId: string,
     socket: Socket,
-    lifecycle: RpcHandlerLifecycle = createRpcRegistrationLifecycle(userId, socket.id),
+    lifecycle?: RpcHandlerLifecycle,
+    connection?: ClientConnection,
 ): RpcHandlerLifecycle {
+    lifecycle ??= createRpcRegistrationLifecycle(
+        userId,
+        socket.id,
+        undefined,
+        undefined,
+        connection?.connectionType === "session-scoped" && !connection.replayOnly
+            ? {
+                sessionId: connection.sessionId,
+                ...(connection.sessionInstanceId
+                    ? { sessionInstanceId: connection.sessionInstanceId }
+                    : {}),
+                ...(connection.runtimeConnectionLeaseId
+                    ? { leaseId: connection.runtimeConnectionLeaseId }
+                    : {}),
+            }
+            : undefined,
+    );
+
     socket.on("rpc-register", async (data: unknown) => {
         try {
             const method = data && typeof data === "object"
@@ -87,9 +131,19 @@ export function rpcHandler(
                 return;
             }
 
+            // Runtime lifecycles fence both the initial Redis install and every
+            // subsequent refresh/reclaim internally, in one lock order:
+            // lifecycle serialization -> DB owner lock -> Redis.
             await lifecycle.register(method);
             socket.emit("rpc-registered", { method });
         } catch (error) {
+            if (error instanceof RpcRegistrationCancelledError) return;
+            if (error instanceof RpcRegistrationOwnershipLostError
+                && connection?.connectionType === "session-scoped") {
+                rejectRuntimeConnection(connection, "RPC registration lease lost");
+                socket.emit("rpc-error", { type: "register", error: "Runtime connection is stale" });
+                return;
+            }
             log({ module: "websocket", level: "error" }, `Error in rpc-register: ${error}`);
             socket.emit("rpc-error", { type: "register", error: "Internal error" });
         }
@@ -114,6 +168,11 @@ export function rpcHandler(
     });
 
     socket.on("rpc-call", async (data: unknown, callback?: (response: unknown) => void) => {
+        if (connection?.connectionType === "session-scoped") {
+            rejectRuntimeConnection(connection, "session runtime attempted rpc-call");
+            callback?.({ ok: false, error: "Session runtimes cannot initiate RPC calls" });
+            return;
+        }
         const request = data && typeof data === "object"
             ? data as Record<string, unknown>
             : {};
@@ -169,7 +228,53 @@ export function rpcHandler(
         };
 
         try {
-            const response = await emitToSelectedTarget(socket, target, forwardedRequest);
+            let response: unknown;
+            if (target.runtimeOwner) {
+                const localDispatchState: {
+                    value: Awaited<ReturnType<typeof emitToLocalRuntimeTarget>>;
+                } = { value: { dispatched: false } };
+                const ownerResult = await runWithRuntimeConnectionOwnerLock({
+                    accountId: userId,
+                    sessionId: target.runtimeOwner.sessionId,
+                    sessionInstanceId: target.runtimeOwner.sessionInstanceId,
+                    leaseId: target.runtimeOwner.leaseId,
+                }, async () => {
+                    localDispatchState.value = await emitToLocalRuntimeTarget(
+                        socket,
+                        target!,
+                        forwardedRequest,
+                    );
+                });
+                if (ownerResult === "busy") {
+                    callback?.(withCallId({
+                        ok: false,
+                        outcome: "not_started",
+                        retryable: true,
+                        error: "RPC target is busy",
+                    }, callId));
+                    return;
+                }
+                if (ownerResult === "not_owner") {
+                    callback?.(withCallId({
+                        ok: false,
+                        error: "RPC method not available",
+                    }, callId));
+                    return;
+                }
+                const localDispatch = localDispatchState.value;
+                if (!localDispatch.dispatched) {
+                    callback?.(withCallId({
+                        ok: false,
+                        outcome: "not_started",
+                        retryable: true,
+                        error: "RPC method not available",
+                    }, callId));
+                    return;
+                }
+                response = localDispatch.response;
+            } else {
+                response = await emitToSelectedTarget(socket, target, forwardedRequest);
+            }
             callback?.(withCallId({
                 ok: true,
                 result: response,

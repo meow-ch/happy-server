@@ -22,4 +22,6 @@ instances:
       remote_dir: /home/drone/apps/happy-server
       project_name: happy-server
       file: docker-compose.yml
+    # Automatic health-check rollback can restart a lease-unaware binary after
+    # protocol-v1 state exists. Verify manually and recover by rolling forward.
     healthcheck_exempt: true

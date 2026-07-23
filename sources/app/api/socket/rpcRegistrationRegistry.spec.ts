@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 vi.mock("@/storage/redis", () => ({
-    redis: {
+    rpcRegistrationRedis: {
         get: vi.fn(),
         set: vi.fn(),
         eval: vi.fn(),
@@ -213,6 +213,234 @@ describe("RedisRpcRegistrationRegistry", () => {
 
         resolveRefresh([1, 1]);
         await firstRefresh;
+        await lifecycle.close();
+    });
+
+    it("serializes concurrent refresh and registration before taking the owner fence", async () => {
+        let resolveRefresh!: (value: Array<0 | 1>) => void;
+        const redis = new FakeRedis();
+        const registry = new RedisRpcRegistrationRegistry(redis as never, 60_000);
+        const fence = vi.fn(async (operation: () => Promise<void>) => {
+            await operation();
+            return "completed" as const;
+        });
+        const lifecycle = new RpcRegistrationLifecycle(
+            "account-1",
+            "socket-1",
+            registry,
+            20_000,
+            256,
+            {
+                sessionId: "session-1",
+                sessionInstanceId: "90b85ebd-6bb8-41bb-aa2d-681765e24f0d",
+                leaseId: "lease-1",
+            },
+            fence,
+        );
+        await lifecycle.register("method-1");
+        redis.eval.mockImplementationOnce(() => new Promise(resolve => { resolveRefresh = resolve; }));
+
+        const refresh = lifecycle.refresh();
+        await vi.waitFor(() => expect(redis.eval).toHaveBeenCalledTimes(1));
+        const register = lifecycle.register("method-2");
+        expect(redis.set).toHaveBeenCalledTimes(1);
+
+        resolveRefresh([1]);
+        await Promise.all([refresh, register]);
+        expect(redis.set).toHaveBeenCalledTimes(2);
+        expect(fence).toHaveBeenCalledTimes(3);
+        await lifecycle.close();
+    });
+
+    it("retries a busy initial registration server-side until it is installed", async () => {
+        const redis = new FakeRedis();
+        const registry = new RedisRpcRegistrationRegistry(redis as never, 60_000);
+        let attempts = 0;
+        const fence = vi.fn(async (operation: () => Promise<void>) => {
+            attempts += 1;
+            if (attempts === 1) return "busy" as const;
+            await operation();
+            return "completed" as const;
+        });
+        const lifecycle = new RpcRegistrationLifecycle(
+            "account-1",
+            "socket-1",
+            registry,
+            20_000,
+            256,
+            {
+                sessionId: "session-1",
+                sessionInstanceId: "90b85ebd-6bb8-41bb-aa2d-681765e24f0d",
+                leaseId: "lease-1",
+            },
+            fence,
+        );
+
+        await lifecycle.register("session-1:status");
+
+        expect(fence).toHaveBeenCalledTimes(2);
+        await expect(registry.resolve("account-1", "session-1:status")).resolves.toMatchObject({
+            socketId: "socket-1",
+        });
+        await lifecycle.close();
+    });
+
+    it("retries a transient fail-fast Redis registration error while the lifecycle is live", async () => {
+        const redis = new FakeRedis();
+        redis.set.mockRejectedValueOnce(new Error("Redis reconnecting"));
+        const registry = new RedisRpcRegistrationRegistry(redis as never, 60_000);
+        const fence = vi.fn(async (operation: () => Promise<void>) => {
+            await operation();
+            return "completed" as const;
+        });
+        const lifecycle = new RpcRegistrationLifecycle(
+            "account-1",
+            "socket-1",
+            registry,
+            20_000,
+            256,
+            {
+                sessionId: "session-1",
+                sessionInstanceId: "90b85ebd-6bb8-41bb-aa2d-681765e24f0d",
+                leaseId: "lease-1",
+            },
+            fence,
+        );
+
+        await lifecycle.register("session-1:status");
+
+        expect(redis.set).toHaveBeenCalledTimes(2);
+        await expect(registry.resolve("account-1", "session-1:status")).resolves.toMatchObject({
+            socketId: "socket-1",
+        });
+        await lifecycle.close();
+    });
+
+    it.each(["close", "unregister"] as const)(
+        "%s cancels a busy pending registration before any late Redis install",
+        async (cancellation) => {
+            const redis = new FakeRedis();
+            const registry = new RedisRpcRegistrationRegistry(redis as never, 60_000);
+            const fence = vi.fn(async () => "busy" as const);
+            const lifecycle = new RpcRegistrationLifecycle(
+                "account-1",
+                "socket-1",
+                registry,
+                20_000,
+                256,
+                {
+                    sessionId: "session-1",
+                    sessionInstanceId: "90b85ebd-6bb8-41bb-aa2d-681765e24f0d",
+                    leaseId: "lease-1",
+                },
+                fence,
+            );
+            const registering = lifecycle.register("session-1:status");
+            await vi.waitFor(() => expect(fence).toHaveBeenCalled());
+
+            const cancellationPromise = cancellation === "close"
+                ? lifecycle.close()
+                : lifecycle.unregister("session-1:status");
+
+            await expect(registering).rejects.toThrow("cancelled");
+            await cancellationPromise;
+            expect(redis.set).not.toHaveBeenCalled();
+            await expect(registry.resolve("account-1", "session-1:status")).resolves.toBeNull();
+            if (cancellation !== "close") await lifecycle.close();
+        },
+    );
+
+    it("does not let a stale high-clock owner reclaim Redis after a successor claims", async () => {
+        const redis = new FakeRedis();
+        const registry = new RedisRpcRegistrationRegistry(redis as never, 60_000);
+        let currentOwner = "A";
+        const fence = (owner: "A" | "B") => vi.fn(async (operation: () => Promise<void>) => {
+            if (currentOwner !== owner) return "not_owner" as const;
+            await operation();
+            return "completed" as const;
+        });
+        const ownerA = fence("A");
+        const ownerB = fence("B");
+        const runtimeOwnerA = {
+            sessionId: "session-1",
+            sessionInstanceId: "90b85ebd-6bb8-41bb-aa2d-681765e24f0d",
+            leaseId: "lease-A",
+        };
+        const runtimeOwnerB = {
+            sessionId: "session-1",
+            sessionInstanceId: "1c7b7208-6d1c-44e1-b855-1d51f59e22ca",
+            leaseId: "lease-B",
+        };
+        const stale = new RpcRegistrationLifecycle(
+            "account-1", "socket-A", registry, 20_000, 256, runtimeOwnerA, ownerA,
+        );
+        const successor = new RpcRegistrationLifecycle(
+            "account-1", "socket-B", registry, 20_000, 256, runtimeOwnerB, ownerB,
+        );
+        try {
+            // A's clock is far ahead. Generation ordering alone would allow A
+            // to overwrite B after Redis loss; DB ownership must be decisive.
+            await stale.register("session-1:status");
+            const staleRegistration = [...(stale as any).registrations.values()][0];
+            staleRegistration.generation = "9999999999999999:99999999:550e8400-e29b-41d4-a716-446655440000";
+            currentOwner = "B";
+            await successor.register("session-1:status");
+
+            redis.values.clear();
+            redis.ttlByKey.clear();
+            redis.eval.mockClear();
+            await stale.refresh();
+            expect(redis.eval).not.toHaveBeenCalled();
+
+            await successor.refresh();
+            await expect(registry.resolve("account-1", "session-1:status")).resolves.toEqual({
+                socketId: "socket-B",
+                generation: expect.any(String),
+                runtimeOwner: runtimeOwnerB,
+            });
+            expect(ownerA).toHaveBeenLastCalledWith(expect.any(Function));
+            expect(ownerB).toHaveBeenCalled();
+        } finally {
+            await stale.close();
+            await successor.close();
+        }
+    });
+
+    it("preserves registrations when a refresh cannot acquire the owner lock", async () => {
+        const redis = new FakeRedis();
+        const registry = new RedisRpcRegistrationRegistry(redis as never, 60_000);
+        let result: "completed" | "busy" = "completed";
+        const fence = vi.fn(async (operation: () => Promise<void>) => {
+            if (result === "busy") return "busy" as const;
+            await operation();
+            return "completed" as const;
+        });
+        const lifecycle = new RpcRegistrationLifecycle(
+            "account-1",
+            "socket-1",
+            registry,
+            20_000,
+            256,
+            {
+                sessionId: "session-1",
+                sessionInstanceId: "90b85ebd-6bb8-41bb-aa2d-681765e24f0d",
+                leaseId: "lease-1",
+            },
+            fence,
+        );
+        await lifecycle.register("session-1:status");
+        redis.eval.mockClear();
+        result = "busy";
+
+        await lifecycle.refresh();
+        expect(redis.eval).not.toHaveBeenCalled();
+
+        result = "completed";
+        await lifecycle.refresh();
+        expect(redis.eval).toHaveBeenCalledTimes(1);
+        await expect(registry.resolve("account-1", "session-1:status")).resolves.toMatchObject({
+            socketId: "socket-1",
+        });
         await lifecycle.close();
     });
 

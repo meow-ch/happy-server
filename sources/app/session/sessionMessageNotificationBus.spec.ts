@@ -5,6 +5,8 @@ function notification() {
     return {
         userId: "account-1",
         originSocketId: "socket-1",
+        targetRuntimeConnectionLeaseId: "lease-1",
+        targetLegacyRuntimeConnection: false,
         payload: {
             id: "notification-1",
             seq: 31,

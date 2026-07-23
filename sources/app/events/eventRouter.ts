@@ -12,7 +12,10 @@ export interface SessionScopedConnection {
     userId: string;
     sessionId: string;
     sessionInstanceId?: string;
+    runtimeConnectionLeaseId?: string;
+    runtimeConnectionLeaseRejected?: boolean;
     replayOnly?: boolean;
+    replayRequestedSessionInstanceId?: string | null;
 }
 
 export interface UserScopedConnection {
@@ -45,15 +48,34 @@ function accountRoom(userId: string, scope: string): string {
 }
 
 export function getConnectionRooms(connection: ClientConnection | ConnectionScope): string[] {
+    if (connection.connectionType === "session-scoped" && connection.replayOnly) {
+        return [];
+    }
     const rooms = [accountRoom(connection.userId, "all")];
     if (connection.connectionType === "user-scoped") {
         rooms.push(accountRoom(connection.userId, "user"));
     } else if (connection.connectionType === "session-scoped") {
-        rooms.push(accountRoom(connection.userId, `session:${connection.sessionId}`));
+        if (connection.runtimeConnectionLeaseId) {
+            rooms.push(getRuntimeConnectionLeaseRoom(
+                connection.userId,
+                connection.sessionId,
+                connection.runtimeConnectionLeaseId,
+            ));
+        } else {
+            rooms.push(accountRoom(connection.userId, `session:${connection.sessionId}`));
+        }
     } else {
         rooms.push(accountRoom(connection.userId, `machine:${connection.machineId}`));
     }
     return rooms;
+}
+
+export function getRuntimeConnectionLeaseRoom(
+    userId: string,
+    sessionId: string,
+    leaseId: string,
+): string {
+    return accountRoom(userId, `session:${sessionId}:runtime-lease:${leaseId}`);
 }
 
 export function getRecipientRooms(userId: string, filter: RecipientFilter): string[] {
@@ -236,6 +258,8 @@ export interface DurableSessionMessageNotification {
     userId: string;
     payload: UpdatePayload;
     originSocketId: string | null;
+    targetRuntimeConnectionLeaseId: string | null;
+    targetLegacyRuntimeConnection: boolean;
 }
 
 // === EVENT ROUTER CLASS ===
@@ -309,12 +333,19 @@ class EventRouter {
      * cluster adapter again here would multiply each notification by pod count.
      */
     emitDurableSessionMessageLocal(notification: DurableSessionMessageNotification): void {
-        const recipientFilter: RecipientFilter = {
-            type: 'all-interested-in-session',
-            sessionId: notification.payload.body.sid as string
-        };
+        const sessionId = notification.payload.body.sid as string;
+        const recipientRooms = [accountRoom(notification.userId, "user")];
+        if (notification.targetRuntimeConnectionLeaseId) {
+            recipientRooms.push(getRuntimeConnectionLeaseRoom(
+                notification.userId,
+                sessionId,
+                notification.targetRuntimeConnectionLeaseId,
+            ));
+        } else if (notification.targetLegacyRuntimeConnection) {
+            recipientRooms.push(accountRoom(notification.userId, `session:${sessionId}`));
+        }
         if (this.io) {
-            let target = this.io.local.to(getRecipientRooms(notification.userId, recipientFilter));
+            let target = this.io.local.to(recipientRooms);
             if (notification.originSocketId) {
                 target = target.except(notification.originSocketId);
             }
@@ -326,7 +357,17 @@ class EventRouter {
         if (!connections) return;
         for (const connection of connections) {
             if (connection.socket.id === notification.originSocketId) continue;
-            if (!this.shouldSendToConnection(connection, recipientFilter)) continue;
+            const isUserObserver = connection.connectionType === "user-scoped";
+            const isLeaseTarget = connection.connectionType === "session-scoped"
+                && !connection.replayOnly
+                && connection.sessionId === sessionId
+                && connection.runtimeConnectionLeaseId === notification.targetRuntimeConnectionLeaseId;
+            const isLegacyTarget = connection.connectionType === "session-scoped"
+                && !connection.replayOnly
+                && connection.sessionId === sessionId
+                && !connection.runtimeConnectionLeaseId
+                && notification.targetLegacyRuntimeConnection;
+            if (!isUserObserver && !isLeaseTarget && !isLegacyTarget) continue;
             connection.socket.emit('update', notification.payload);
         }
     }
@@ -341,6 +382,7 @@ class EventRouter {
             case 'all-interested-in-session':
                 // Send to session-scoped with matching session + all user-scoped
                 if (connection.connectionType === 'session-scoped') {
+                    if (connection.replayOnly) return false;
                     if (connection.sessionId !== filter.sessionId) {
                         return false;  // Wrong session
                     }
@@ -365,7 +407,7 @@ class EventRouter {
 
             case 'all-user-authenticated-connections':
                 // Send to all connection types (default behavior)
-                return true;
+                return connection.connectionType !== 'session-scoped' || !connection.replayOnly;
 
             default:
                 return false;

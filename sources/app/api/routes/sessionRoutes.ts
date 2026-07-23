@@ -8,6 +8,7 @@ import { randomKeyNaked } from "@/utils/randomKeyNaked";
 import { allocateUserSeq } from "@/storage/seq";
 import { sessionDelete } from "@/app/session/sessionDelete";
 import { listStoredSessionMessagesAfterSeq } from "@/app/session/sessionMessageList";
+import { findRuntimeConnectionSession } from "@/app/presence/runtimeConnectionLease";
 
 export function sessionRoutes(app: Fastify) {
 
@@ -323,7 +324,13 @@ export function sessionRoutes(app: Fastify) {
                     session: z.object({
                         id: z.string(),
                         agentStateVersion: z.number().int(),
+                        runtimeConnectionProtocolVersion: z.literal(1),
                         runtimeConnected: z.boolean(),
+                        runtimeInstanceId: z.string().nullable(),
+                        runtimeLeaseInstanceId: z.string().nullable(),
+                        runtimeLeaseExpiresAt: z.number().int().nullable(),
+                        runtimeInstanceRetired: z.boolean(),
+                        runtimeConnectionCheckedAt: z.number().int(),
                         dataEncryptionKey: z.string().nullable()
                     })
                 }),
@@ -340,18 +347,7 @@ export function sessionRoutes(app: Fastify) {
         reply.header('Cache-Control', 'private, no-store');
         reply.header('Vary', 'Authorization');
 
-        const session = await db.session.findFirst({
-            where: {
-                id: sessionId,
-                accountId: userId
-            },
-            select: {
-                id: true,
-                agentStateVersion: true,
-                activeInstanceId: true,
-                dataEncryptionKey: true
-            }
-        });
+        const session = await findRuntimeConnectionSession(userId, sessionId);
 
         if (!session) {
             return reply.code(404).send({
@@ -364,7 +360,13 @@ export function sessionRoutes(app: Fastify) {
             session: {
                 id: session.id,
                 agentStateVersion: session.agentStateVersion,
-                runtimeConnected: session.activeInstanceId !== null,
+                runtimeConnectionProtocolVersion: session.runtimeConnectionProtocolVersion,
+                runtimeConnected: session.runtimeConnected,
+                runtimeInstanceId: session.runtimeInstanceId,
+                runtimeLeaseInstanceId: session.runtimeLeaseInstanceId,
+                runtimeLeaseExpiresAt: session.runtimeLeaseExpiresAt?.getTime() ?? null,
+                runtimeInstanceRetired: session.runtimeInstanceRetired,
+                runtimeConnectionCheckedAt: session.runtimeConnectionCheckedAt.getTime(),
                 dataEncryptionKey: session.dataEncryptionKey === null
                     ? null
                     : Buffer.from(session.dataEncryptionKey).toString('base64')

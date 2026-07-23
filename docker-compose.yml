@@ -2,6 +2,7 @@ services:
   app:
     image: ${DOCKER_IMAGE}:${DOCKER_IMAGE_TAG:-latest}
     restart: unless-stopped
+    stop_grace_period: 45s
     environment:
       - DATABASE_URL
       - REDIS_URL

@@ -4,10 +4,8 @@ metadata:
   name: handy-server
 spec:
   strategy:
-    type: RollingUpdate
-    rollingUpdate:
-      maxUnavailable: 0
-      maxSurge: 1
+    # Lease protocol versions must never overlap against one database.
+    type: Recreate
   replicas: 1
   selector:
     matchLabels:
@@ -21,6 +19,7 @@ spec:
         prometheus.io/port: "9090"
         prometheus.io/path: "/metrics"
     spec:
+      terminationGracePeriodSeconds: 45
       containers:
       - name: handy
         image: docker.korshakov.com/handy-server:{version}
@@ -54,16 +53,6 @@ spec:
           periodSeconds: 5
           timeoutSeconds: 3
           failureThreshold: 3
----
-apiVersion: policy/v1
-kind: PodDisruptionBudget
-metadata:
-  name: handy-server-pdb
-spec:
-  minAvailable: 1
-  selector:
-    matchLabels:
-      app: handy-server
 ---
 apiVersion: external-secrets.io/v1beta1
 kind: ExternalSecret
